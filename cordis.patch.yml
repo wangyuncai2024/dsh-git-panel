@@ -1,0 +1,18 @@
+# ============================================================================
+# dsh-git-panel —— Git 面板插件 · bundle patch（挂载声明）
+# ============================================================================
+# 本文件随插件包分发：DSH 启动时按 bundle 层栈叠加各插件 patch，
+# 这一层把本插件插入 Web profile 的配置树。
+#
+# 安装：
+#   dsh plugin --profile web add link:/home/wangyuncai/DSH-project/GitHub插件
+#   # 然后把 "dsh-git-panel" 加进 profile package.json 的 dsh.profile.bundles
+#
+# 卸载：
+#   dsh plugin --profile web remove dsh-git-panel
+#
+# 可用行配置（在 profile 的 cordis.patch.yml 里用同一个 id 覆盖）：
+#   defaultDir: ''   # 面板默认操作的目录；留空 = 跟随当前会话工作目录
+- insert:
+    - id: git-panel
+      name: 'dsh-git-panel'
