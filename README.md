@@ -14,10 +14,26 @@ DSH（DeepSeek Harness）Git 面板插件：在界面右下角提供一个**纯�
 | 全部暂存 | `git add -A` |
 | 提交 | 输入框写提交信息，一键 `git commit` |
 | 拉取 / 推送 / 获取远程 | `git pull` / `git push` / `git fetch --all --prune` |
+| 远程 / 配置 | 查看或修改推送目标（`git remote add` / `set-url`） |
 | 切换 / 刷新 | 换一个目录操作 / 重新读取状态 |
 
-面板同时展示：当前分支、改动清单（文件级）、最近 8 次提交、每条命令的执行结果。
+面板同时展示：当前分支、上游跟踪状态（领先/落后几个提交）、远程地址、
+改动清单（文件级）、最近 8 次提交、每条命令的执行结果。
 右上角「—」可把面板收起成一个小胶囊。
+
+**推送不会「点了没反应」**：推送失败时面板不再只丢一行 git 英文报错，而是
+先按 git 的反馈替用户做一步，再给出下一步该点哪里：
+
+| 失败原因 | 面板行为 |
+| --- | --- |
+| 本地分支还没有上游（新仓库第一次推） | 自动改用 `git push --set-upstream <远程> HEAD` 重推，成功后建立跟踪 |
+| 仓库没有配置远程 | 自动展开地址输入框 + 提示，填好点「保存并推送」一步完成 |
+| 远程仓库不存在 / 没权限 | 提示检查地址是否写对、GitHub 上是否已建该仓库 |
+| SSH 认证失败 | 提示检查公钥是否已加到 GitHub，或改用 HTTPS 地址 |
+| 非快进（远程有你没有的提交） | 提示先点「拉取」合并再推送，不擅自强推 |
+
+这些判断都在宿主侧完成（`classifyPushFailure` / `recoverPush`），面板只负责显示，
+因此 AI 工具走同一条逻辑。
 
 **设置开关**：设置 → 通用 → 「Git 面板」，一键开启/关闭。状态记在浏览器
 `localStorage`（key: `dsh-git-panel-enabled`），默认开启。
@@ -25,7 +41,8 @@ DSH（DeepSeek Harness）Git 面板插件：在界面右下角提供一个**纯�
 **AI 也能用**：插件同时注册了 13 个 git 模型工具（`git_status`、`git_add`、
 `git_commit`、`git_log`、`git_diff`、`git_branch`、`git_checkout`、`git_pull`、
 `git_push`、`git_clone`、`git_init`、`git_remote`、`git_run`），装好后直接对
-AI 说「帮我提交」即可。
+AI 说「帮我提交」即可。其中 `git_remote` 的 `action=set` 就是「配置推送目标」：
+同名远程已存在则改地址，否则新增。
 
 ## 安装（link 方式，本地开发）
 
@@ -70,6 +87,13 @@ GitHub插件/               # 本工作区根目录 = 插件包本体（link 安
   面板永远能渲染出原因。
 - **目录跟随会话**：面板通过 `shell.overlay` 的标准 props `useSessions` 读取当前会话
   的工作目录，切换会话时自动跟随；也可在面板里手动切换到任意目录。
+- **推送失败先补救再报错**：`POST /git-panel/op {op:"push"}` 的响应带
+  `reason`（`no-remote` / `no-upstream` / `remote-not-found` / `auth-failed` /
+  `rejected`）与 `hint`（中文下一步提示），面板据此自动展开地址输入框或提示先拉取。
+  自动动作只做一件：无上游时补 `--set-upstream <远程> HEAD`（`retried:true` 表示
+  命令被替换过）。认证失败与强推绝不动手 —— 前者需要用户给凭证，后者会改写历史。
+- **远程地址一行搞定**：`op:"setRemote"` 会先查 `git remote`，再决定用 `add` 还是
+  `set-url`，所以同一个「保存并推送」按钮同时覆盖首次配置和改地址。
 
 ## 配置
 
