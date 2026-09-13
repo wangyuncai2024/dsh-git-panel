@@ -121,6 +121,39 @@ GitHub插件/               # 本工作区根目录 = 插件包本体（link 安
 - **克隆完直接进新仓库**：clone 成功后宿主回传 `clonedDir`（推导结果与
   `git clone` 的默认目标名一致：地址最后一段去掉 `.git`），面板自动切过去并刷新。
 
+## 依赖与兼容性（换机器 / 换 DSH 版本）
+
+这一节是「拷到别的机器、装到别的 DSH 版本」时的核对清单，全部按当前实测的
+DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.webServer` /
+`ctx.tools` / `ctx.slots`）写成，**没有任何 npm 依赖需要解析**。
+
+| 面向 | 依赖 | 说明 |
+| --- | --- | --- |
+| 宿主半边 | `node:child_process` `node:fs/promises` `node:os` `node:path` `node:util` | 全是 Node 内置；`dependencies` 为空，`npm ls --all` 输出 `(empty)` |
+| 宿主服务 | `webServer.register(route)`、`tools.register(definition)` | 两者都是**惰性服务**：先 `ctx.get()`，取不到就 `ctx.inject([...])` 等服务就绪，**两者都缺也照常加载**（只是没有路由/工具） |
+| 客户端半边 | `require('react')` | react 是 DSH web shell 的**平台种子模块**（`getStaticModules()`），不需要本插件声明、也不必随包分发 |
+| 客户端服务 | `ctx.slots.register / inject` | 客户端 `inject: ['slots']` 声明；服务缺失时静默降级，不抛异常 |
+| 界面插槽 | `shell.overlay`、`settings.general.item` | 由 `ui-layout` / `ui-settings-general` 声明；两者都不存在时只是界面不出现，宿主功能不受影响 |
+| Node | `engines.node: ^22.19.0 \|\| >=24.0.0` | 与 DSH 本体一致。`execFile` 的 `signal` 选项需要 Node ≥ 15.4；更老的版本会自动不传 `signal`（只是失去取消传播，功能仍在） |
+
+**插件包的挂载契约**（升级 DSH 时最该核对的三个字段，`test/standalone.test.mjs`
+会把它们锁住）：
+
+```jsonc
+"exports": { "./client": "./lib/client.js" },   // 客户端 bundle 必须从这里导出
+"dsh": {
+  "bundle": { "patch": "./cordis.patch.yml" },  // 宿主 profile 层的挂载声明
+  "client": { "platform": "web", "inject": [], "immediately": true }
+}
+```
+
+- `platform` 必须是 `web`（宿主扫描 `dsh.client` 时只认这一种）。
+- `inject` 留空是对的：插件不 `require` 别的客户端包；对 `slots` 服务的依赖由
+  客户端 `inject: ['slots']` 在 Cordis 服务层等待 —— 服务永远不出现也只是
+  **等待**，不会被判成加载失败。
+- 客户端 bundle 必须是普通脚本（`window.__ModuleLoader__.load({id, factory})`），
+  **不能有 ESM / JSX / TS 语法** —— 它不经过任何构建工具。
+
 ## 配置
 
 在 profile 的 `cordis.patch.yml` 里用同一个 id 覆盖行配置：
@@ -131,22 +164,36 @@ GitHub插件/               # 本工作区根目录 = 插件包本体（link 安
     defaultDir: /home/me/project   # 缺省操作目录；留空 = 跟随当前会话工作目录
 ```
 
+## 安全边界（部署时注意）
+
+面板路由 `/git-panel/*` **没有独立鉴权**，执行类请求只校验 `Origin` 同源。
+因此：
+
+- 绑定 `127.0.0.1` 时，能访问到的只有本机进程；
+- 若 `webserver.host` 配成 `0.0.0.0`（手机 / 局域网访问场景常见），同网段的主机
+  只要能在 HTTP 头里伪造 `Origin`，就能调用这些接口执行
+  `git clone / pull / push / commit` 等操作。
+
+结论：**把 Git 面板和「对局域网开放 web 端口」分开考虑**；确实需要对局域网开放时，
+请用 DSH 的配对 / 鉴权层限制访问，或让 `webserver.host` 保持回环。
+
 ## 开发注记（两个真踩过的坑）
 
 写这类界面插件时，下面两点都会让功能**静默消失、且不报任何错**，值得记下来：
 
-1. **`ctx.slots.inject(name, cb)` 只在「将来的声明事件」上回调。**
-   它底层是 `subscribeDeclaration`，只挂监听器、**不检查该插槽当前是否已存在**。
-   于是：插件加载时插槽还没建 → 能等到回调；插件加载时插槽**早就建好了**
-   （例如设置模块在启动早期就声明好的 `settings.general.item`）→ 监听器永远等不到事件，
-   注册静默丢失。
-   本插件的做法是 `registerSlot()`：**先直接 register，抛错（尚未声明）才退回 inject 等待**，
-   两种时机都覆盖。
+1. **不能只靠 `ctx.slots.inject(name, cb)` 注册界面。**
+   它的语义是「声明事件上回调」；当前实现订阅后确实会立刻 reconcile 一次，但这个
+   行为不保证跨版本稳定。当插件加载时插槽**早就声明好**（例如设置模块在启动早期
+   就声明的 `settings.general.item`），只写 inject 就有等不到回调的风险，注册会静默丢失。
+   本插件的做法是 `registerSlot()`：**先直接 register，抛错（尚未声明）才退回
+   inject 等待**，两种时机都覆盖；并且**只有真的注册成功才记 `declared-later`** ——
+   声明已到却仍注册失败（priority 占用、options 结构变化等）会把真实原因回报到诊断，
+   不会被误当成「还没声明」。
 
 2. **`tools` / `webServer` 是惰性服务。**
    `apply()` 执行时 `ctx.get('tools')` 常常还是 `undefined`；只读一次就永远错过，
    13 个 git 工具会全部不注册。本插件对两者都做「现有实例优先、取不到就
-   `ctx.inject([...], cb)` 等服务就绪」。
+   `ctx.inject([...], cb)` 等服务就绪」，两者都缺时也只是降级、不影响加载。
 
 ### 客户端诊断日志
 
@@ -156,8 +203,9 @@ GitHub插件/               # 本工作区根目录 = 插件包本体（link 安
 ~/.dsh/git-panel-diag.log
 ```
 
-内容包括 `apply:start`、`overlay:registered-direct`、`settings:direct-failed` 这类阶段标记，
-排查「面板出现了但设置行没出现」时直接看这个文件即可。该文件可以随时删除。
+内容包括 `apply:start`、`overlay:registered-direct`、`overlay:direct-failed`、
+`settings:register-failed-after-declaration` 这类阶段标记，排查「面板出现了但设置行
+没出现」时直接看这个文件即可。该文件可以随时删除。
 
 ## 测试
 
@@ -165,9 +213,19 @@ GitHub插件/               # 本工作区根目录 = 插件包本体（link 安
 决策、clone 目标名、目录归一化），用 Node 自带测试框架覆盖：
 
 ```bash
-npm test    # node --test，自动发现 test/ 目录，30 个用例，毫秒级完成
+npm test        # node --test：61 个用例，毫秒级完成
 npm run check   # 语法检查（index.js + client.js）
 ```
+
+其中两个文件专门验证「**独立运行**」，不需要 DSH、不需要装任何东西：
+
+| 文件 | 验证什么 |
+| --- | --- |
+| `test/standalone.test.mjs` | 用 mock ctx 把宿主半边跑一遍：`import` 不抛异常；`apply()` 在「服务就绪 / 稍后就绪 / 都缺 / ctx 被裁剪」四种情况下都不抛；卸载能清空路由与工具；13 个工具的 `parameters` 都落在 harness 支持的 JSON Schema 子集内（用了 `anyOf` / `$ref` / `format` 之类会让 `tools.register` 抛错、工具静默全丢） |
+| `test/client.test.mjs` | 用假 window + 假 React 把客户端 bundle 求值一遍：bundle 格式与 id 正确；**只 require `react` 这一个种子模块**（多 require 别的就说明依赖了构建产物）；导出 `apply` + `inject: ['slots']`；`slots` 缺失 / 直接注册成功 / 稍后声明三种时机都不抛；注册失败会把真实原因回报；组件在 props 缺失时也能渲染（slot 契约变化不白屏） |
+
+> 这两个文件是**换机器、换 DSH 版本时的第一道回归**：`npm test` 过了，说明插件
+> 自身的加载与注册契约没变；剩下的只是 DSH 侧服务是否提供（缺了就优雅降级）。
 
 ## License
 
