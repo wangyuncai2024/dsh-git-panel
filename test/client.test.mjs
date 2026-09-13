@@ -13,6 +13,8 @@
 //   6. 点改动看 diff 能走到终态（真状态重渲染），不会永远停在「加载中…」——
 //      这一条是回归测试：runOp 曾把结果变量声明在 try 块里，每次调用都以
 //      ReferenceError 结束，宿主侧 git 明明执行成功了，调用方却永远拿不到返回值。
+//   7. 切换工作区后，面板上的东西（命令结果栏 / diff / 分支列表 / 状态）都属于
+//      新工作区：属于旧仓库的瞬时结果会被清掉，切走之后才回来的异步结果会被丢弃。
 // ============================================================================
 
 import test from 'node:test'
@@ -499,4 +501,137 @@ test('client standalone：runOp 失败时调用方拿到 ok:false（而不是 un
     pres.some((text) => text.includes('查看 diff 失败：HTTP 500')),
     `失败原因要原样回报，而不是「未知错误」：${JSON.stringify(pres)}`,
   )
+})
+
+// ── 5. 回归：切换工作区后，面板上的东西必须跟着切 ───────────────────────────
+//
+// 曾出现的问题：换工作区（切会话 / 手动切目录）后只有 snapshot 被替换，命令结果栏
+// 还挂着旧仓库上一次 git 操作的输出。根因是有一批状态属于「某个具体仓库」却没有
+// 任何人在切换时清理；同时迟到的异步结果也没有归属校验，慢操作（拉取/推送/克隆的
+// 宿主超时是 10 分钟）回来时会直接盖到新工作区上。
+
+/** 让 `/git-panel/state` 按 `?dir=` 返回不同仓库，用来验证面板真的换了工作区。 */
+function makeDirAwareFetch(harness, byDir) {
+  const base = harness.fetchStub
+  return async (url, init = {}) => {
+    const text = String(url)
+    if (text.includes('/git-panel/state')) {
+      const match = /[?&]dir=([^&]*)/.exec(text)
+      const dir = match === null ? '' : decodeURIComponent(match[1])
+      if (Object.hasOwn(byDir, dir)) {
+        harness.calls.fetch.push({ url, init })
+        return { status: 200, json: async () => byDir[dir] }
+      }
+    }
+    return base(url, init)
+  }
+}
+
+/** 在给定会话 store 上挂载面板组件（`store` 可变，用来模拟切换工作区）。 */
+function mountPanel(exports, react, store) {
+  const { slots, registered } = makeSlots()
+  exports.apply({ slots })
+  const panel = registered.find((entry) => entry.options.name === 'shell.overlay').component
+  react.mount(panel, { useSessions: (selector) => selector(store) })
+}
+
+/** 命令结果栏（面板里所有 <pre> 的文本）。 */
+function outputBars(tree) {
+  return flattenTree(tree).filter((node) => node.type === 'pre').map(textOf)
+}
+
+/** 找一个按钮元素（按可见文本）。 */
+function findButton(tree, label) {
+  return flattenTree(tree).find((node) => node.type === 'button' && textOf(node) === label)
+}
+
+const WS_A = {
+  ok: true, dir: '/tmp/ws-a', isRepo: true, branch: 'main', upstream: null,
+  ahead: 0, behind: 0, changes: [{ code: ' M', path: 'a.txt', staged: false }],
+  log: [], remotes: [],
+}
+const WS_B = {
+  ok: true, dir: '/tmp/ws-b', isRepo: true, branch: 'dev', upstream: null,
+  ahead: 0, behind: 0, changes: [], log: [], remotes: [],
+}
+
+test('client standalone：切换工作区后命令结果栏不再挂着上一个工作区的输出', async () => {
+  const opResult = {
+    ok: true, command: 'git add -A', exitCode: 0, stdout: '', stderr: '', message: null,
+    hint: null, clonedDir: null, branches: null, diff: null, state: WS_A,
+  }
+  const harness = makeFakeWindow({ stateResponse: WS_A, opResponse: opResult })
+  harness.fetchStub = makeDirAwareFetch(harness, { '/tmp/ws-a': WS_A, '/tmp/ws-b': WS_B })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  const store = { current: 's1', byId: { s1: { cwd: '/tmp/ws-a' } } }
+  mountPanel(exports, react, store)
+
+  const first = await react.settle()
+  assert.ok(textOf(first).includes('/tmp/ws-a'), '前置条件：面板要先加载到工作区 A')
+
+  const addAll = findButton(first, '全部暂存')
+  assert.ok(addAll !== undefined, 'A 是仓库，「全部暂存」按钮应该出现')
+  await addAll.props.onClick()
+  const afterOp = await react.settle()
+  assert.ok(
+    outputBars(afterOp).some((text) => text.includes('git add -A')),
+    `前置条件：A 的命令结果栏里要有刚跑完的输出，实际：${JSON.stringify(outputBars(afterOp))}`,
+  )
+
+  // 换工作区：等价于用户在界面上切到另一个会话（当前会话的 cwd 变了）。
+  store.byId.s1.cwd = '/tmp/ws-b'
+  const afterSwitch = await react.settle()
+
+  assert.ok(textOf(afterSwitch).includes('/tmp/ws-b'), '面板本身要跟着切到工作区 B')
+  assert.ok(textOf(afterSwitch).includes('dev'), '分支要显示 B 的分支')
+  assert.ok(
+    !outputBars(afterSwitch).some((text) => text.includes('git add -A')),
+    `切换工作区后命令结果栏不能还挂着 A 的输出，实际：${JSON.stringify(outputBars(afterSwitch))}`,
+  )
+})
+
+test('client standalone：切走之后才回来的操作结果不能盖到新工作区上', async () => {
+  const opResult = {
+    ok: true, command: 'git pull', exitCode: 0, stdout: 'Already up to date.', stderr: '',
+    message: null, hint: null, clonedDir: null, branches: null, diff: null, state: WS_A,
+  }
+  const harness = makeFakeWindow({ stateResponse: WS_A })
+  const dirAware = makeDirAwareFetch(harness, { '/tmp/ws-a': WS_A, '/tmp/ws-b': WS_B })
+  // 让 /git-panel/op 卡住不返回：模拟一次耗时的 pull（宿主侧超时 10 分钟）。
+  let releaseOp = null
+  harness.fetchStub = async (url, init = {}) => {
+    if (String(url).includes('/git-panel/op')) {
+      harness.calls.fetch.push({ url, init })
+      return await new Promise((resolve) => { releaseOp = resolve })
+    }
+    return dirAware(url, init)
+  }
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  const store = { current: 's1', byId: { s1: { cwd: '/tmp/ws-a' } } }
+  mountPanel(exports, react, store)
+
+  const first = await react.settle()
+  const pull = findButton(first, '拉取')
+  assert.ok(pull !== undefined, 'A 是仓库，「拉取」按钮应该出现')
+  const pending = pull.props.onClick()
+  assert.equal(typeof releaseOp, 'function', '拉取请求应该已经发出去（并且还没回来）')
+
+  // 操作还没回来，用户就切到了另一个工作区。
+  store.byId.s1.cwd = '/tmp/ws-b'
+  const afterSwitch = await react.settle()
+  assert.ok(textOf(afterSwitch).includes('/tmp/ws-b'), '面板要先切到工作区 B')
+
+  // 现在旧工作区的操作结果才回来。
+  releaseOp({ status: 200, json: async () => opResult })
+  await pending
+  const finalTree = await react.settle()
+
+  assert.ok(
+    !outputBars(finalTree).some((text) => text.includes('git pull') || text.includes('up to date')),
+    `旧工作区的输出不能盖到新工作区上，实际：${JSON.stringify(outputBars(finalTree))}`,
+  )
+  assert.ok(textOf(finalTree).includes('/tmp/ws-b'), '面板不能被旧工作区的状态切回去')
+  assert.ok(textOf(finalTree).includes('dev'), '旧工作区的状态不能盖掉新工作区的状态')
 })

@@ -204,9 +204,9 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
 结论：**把 Git 面板和「对局域网开放 web 端口」分开考虑**；确实需要对局域网开放时，
 请用 DSH 的配对 / 鉴权层限制访问，或让 `webserver.host` 保持回环。
 
-## 开发注记（三个真踩过的坑）
+## 开发注记（四个真踩过的坑）
 
-写这类界面插件时，下面三点都会让功能**静默失败或半成功、且不报任何错**，值得记下来：
+写这类界面插件时，下面四点都会让功能**静默失败或半成功、且不报任何错**，值得记下来：
 
 1. **不能只靠 `ctx.slots.inject(name, cb)` 注册界面。**
    它的语义是「声明事件上回调」；当前实现订阅后确实会立刻 reconcile 一次，但这个
@@ -236,6 +236,21 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
    `{ ok: false, message }`，这样调用方统一按 `data.ok` 判断，失败原因是真实错误
    而不是一句「未知错误」。回归测试见 `test/client.test.mjs` 第 4 节。
 
+4. **属于某个仓库的状态，必须跟着仓库一起切。**
+   面板里有一批状态是「某个具体仓库的运行结果」——命令结果栏、展开的 diff、分支列表、
+   提交信息草稿、远程地址错误。它们原先和 `snapshot` 放在同一个组件里，而换工作区时
+   只有 `snapshot` 被替换，于是界面已经显示新仓库了，最下面的命令结果栏还挂着旧仓库
+   上一次 git 操作的输出。这一条**看起来像是「刷新没生效」**，其实只是没人负责清。
+   还有一条更隐蔽的来路是**迟到的异步结果**：`pull` / `push` / `clone` 在宿主侧的
+   超时是 10 分钟，用户完全可能在结果回来之前就切走；那条响应回来时会同时写
+   `setOutput()` 和 `setSnapshot()`，把新工作区整个盖回旧工作区。
+   本插件的做法是两条一起上：① `switchDir()` 是**唯一的切换入口**（跟随会话目录、
+   手动切目录、跟随会话按钮都走它），切换时先清掉属于旧仓库的瞬时结果；② 拿宿主回传的
+   `state.dir` 给每条异步结果做归属校验，与当前绑定的目录不一致就整条丢弃 ——
+   两边信息不全时**不拦**，宁可少拦一次也不能把真实输出吞掉。
+   注意**不能把清理挂在「目录变了」上**：克隆成功后也会换目录，但那时输出正是用户要看
+   的克隆结果。回归测试见 `test/client.test.mjs` 第 5 节。
+
 ### 客户端诊断日志
 
 界面注册类问题在浏览器控制台里对用户不可见，因此客户端会把注册过程回报到宿主：
@@ -254,7 +269,7 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
 决策、clone 目标名、目录归一化），用 Node 自带测试框架覆盖：
 
 ```bash
-npm test        # node --test：63 个用例，毫秒级完成
+npm test        # node --test：65 个用例，毫秒级完成
 npm run check   # 语法检查（index.js + client.js）
 ```
 
@@ -263,7 +278,7 @@ npm run check   # 语法检查（index.js + client.js）
 | 文件 | 验证什么 |
 | --- | --- |
 | `test/standalone.test.mjs` | 用 mock ctx 把宿主半边跑一遍：`import` 不抛异常；`apply()` 在「服务就绪 / 稍后就绪 / 都缺 / ctx 被裁剪」四种情况下都不抛；卸载能清空路由与工具；13 个工具的 `parameters` 都落在 harness 支持的 JSON Schema 子集内（用了 `anyOf` / `$ref` / `format` 之类会让 `tools.register` 抛错、工具静默全丢） |
-| `test/client.test.mjs` | 用假 window + 假 React 把客户端 bundle 求值一遍：bundle 格式与 id 正确；**只 require `react` 这一个种子模块**（多 require 别的就说明依赖了构建产物）；导出 `apply` + `inject: ['slots']`；`slots` 缺失 / 直接注册成功 / 稍后声明三种时机都不抛；注册失败会把真实原因回报；组件在 props 缺失时也能渲染（slot 契约变化不白屏）；点改动看 diff 能走到终态（用**有状态**的假 React 真重渲染，不会停在「加载中…」） |
+| `test/client.test.mjs` | 用假 window + 假 React 把客户端 bundle 求值一遍：bundle 格式与 id 正确；**只 require `react` 这一个种子模块**（多 require 别的就说明依赖了构建产物）；导出 `apply` + `inject: ['slots']`；`slots` 缺失 / 直接注册成功 / 稍后声明三种时机都不抛；注册失败会把真实原因回报；组件在 props 缺失时也能渲染（slot 契约变化不白屏）；点改动看 diff 能走到终态（用**有状态**的假 React 真重渲染，不会停在「加载中…」）；**切换工作区后命令结果栏 / diff / 状态都属于新工作区**（旧仓库的瞬时结果被清掉，切走之后才回来的操作结果被丢弃） |
 
 > 这两个文件是**换机器、换 DSH 版本时的第一道回归**：`npm test` 过了，说明插件
 > 自身的加载与注册契约没变；剩下的只是 DSH 侧服务是否提供（缺了就优雅降级）。
