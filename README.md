@@ -65,12 +65,20 @@ AI 说「帮我提交」即可。其中 `git_remote` 的 `action=set` 就是「�
 #    并自动把 "dsh-git-panel" 登记进 dsh.profile.bundles（实测无需手改）
 dsh plugin --profile web add link:/home/wangyuncai/DSH-project/GitHub插件
 
-# 2) 重启 dsh 使新 bundle 生效（bundles 在启动时读取）
+# 2) 重启 dsh 使新 bundle 生效（首次安装：bundles 在启动时读取）
 #    在运行 dsh 的终端按 Ctrl+C，然后重新执行：dsh web
 ```
 
-> 提示：DSH 里安装任何插件都需要重启一次（官方插件市场安装完同样提示「待重启生效」）。
-> 重启后浏览器刷新页面即可，会话记录不会丢失。
+> 提示：**首次安装/卸载**确实要重启一次（`dsh.profile.bundles` 与 patch 在启动时读取），
+> 官方插件市场装完同样提示「待重启生效」。重启后浏览器刷新页面即可，会话记录不会丢失。
+
+### 改代码后怎么生效（link 开发）
+
+| 改了哪里 | 生效方式 |
+| --- | --- |
+| `lib/client.js`（面板界面与交互） | **不用重启 dsh**：客户端 bundle 按文件内容重算版本（`/plugins/<id>/client.js?rev=<hash>`），HMR watch 在跑时页面自动重载，否则刷新一次页面即可 |
+| `lib/index.js`（宿主：`/git-panel/*` 路由、13 个模型工具） | **需要重启 dsh**：宿主插件是 Node 进程启动时 `import` 的，没有热加载 |
+| `package.json` 的 `dsh.bundle` / `cordis.patch.yml`（挂载声明） | **需要重启 dsh**：bundles 与 patch 在启动时读取 |
 
 卸载：
 
