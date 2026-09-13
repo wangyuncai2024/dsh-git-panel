@@ -16,6 +16,8 @@ import {
   remoteOpFor,
   cloneTargetName,
   normalizeDir,
+  parseBranchOutput,
+  truncateText,
 } from '../lib/index.js'
 
 // ── parseBranchLine：porcelain `## ` 分支行 ────────────────────────────────
@@ -175,4 +177,50 @@ test('normalizeDir：绝对路径原样返回', () => {
 test('normalizeDir：~ 与 ~/ 展开为主目录', () => {
   assert.equal(normalizeDir('~'), homedir())
   assert.equal(normalizeDir('~/work/repo'), homedir() + '/work/repo')
+})
+
+// ── parseBranchOutput：git branch --no-color（面板分支管理器） ─────────────
+
+test('parseBranchOutput：常规列表，* 标记当前分支', () => {
+  const parsed = parseBranchOutput('* main\n  feature/x\n  dev\n')
+  assert.equal(parsed.current, 'main')
+  assert.deepEqual(parsed.items, [
+    { name: 'main', current: true },
+    { name: 'feature/x', current: false },
+    { name: 'dev', current: false },
+  ])
+})
+
+test('parseBranchOutput：游离 HEAD 时伪条目被跳过且没有分支被标为当前', () => {
+  const parsed = parseBranchOutput('* (HEAD detached at abc1234)\n  main\n')
+  assert.equal(parsed.current, null)
+  assert.deepEqual(parsed.items, [{ name: 'main', current: false }])
+})
+
+test('parseBranchOutput：只有游离 HEAD（空仓库孤儿分支）→ current 为 null', () => {
+  const parsed = parseBranchOutput('* (HEAD detached at abc1234)\n')
+  assert.equal(parsed.current, null)
+  assert.deepEqual(parsed.items, [])
+})
+
+test('parseBranchOutput：还没有任何分支 → 空列表', () => {
+  const parsed = parseBranchOutput('')
+  assert.equal(parsed.current, null)
+  assert.deepEqual(parsed.items, [])
+})
+
+// ── truncateText：超长输出截断（diff 面板防爆） ────────────────────────────
+
+test('truncateText：短文本原样返回', () => {
+  assert.equal(truncateText('hello', 100), 'hello')
+  assert.equal(truncateText('刚好', 2), '刚好')
+})
+
+test('truncateText：超长按上限截断并保留截断提示', () => {
+  const text = 'x'.repeat(500)
+  const result = truncateText(text, 40)
+  assert.ok(result.startsWith('x'.repeat(40)))
+  assert.ok(result.includes('已截断'))
+  assert.ok(result.length < text.length)
+  assert.ok(result.length < 100)
 })
