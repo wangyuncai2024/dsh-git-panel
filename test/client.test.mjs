@@ -187,16 +187,33 @@ function makeFakeWindow(options = {}) {
     ahead: 0, behind: 0, changes: [], log: [], remotes: [], notice: '不是仓库',
   }
   const opResponse = options.opResponse ?? stateResponse
+  // 网络加速配置：默认是「什么都没开」的干净状态。
+  const netResponse = options.netResponse ?? {
+    ok: true, mirrorEnabled: false, mirror: 'https://gh-proxy.com/',
+    proxy: '', hasProxy: false,
+    candidates: [
+      { id: 'gh-proxy', label: 'gh-proxy.com', prefix: 'https://gh-proxy.com/' },
+      { id: 'ghproxy-net', label: 'ghproxy.net', prefix: 'https://ghproxy.net/' },
+      { id: 'ghfast', label: 'ghfast.top', prefix: 'https://ghfast.top/' },
+    ],
+  }
   const fetchStub = async (url, init = {}) => {
     calls.fetch.push({ url, init })
     if (String(url).includes('/git-panel/diag')) {
       calls.diag.push(JSON.parse(init.body))
       return { status: 200, json: async () => ({ ok: true }) }
     }
+    if (String(url).includes('/git-panel/net')) {
+      // 面板一挂载就会读这份配置；点「检测网络」时走 probe=1 那条分支。
+      const body = options.probeResults !== undefined && String(url).includes('probe=1')
+        ? { ok: true, results: options.probeResults }
+        : netResponse
+      return { status: 200, json: async () => body }
+    }
     const body = String(url).includes('/git-panel/op') ? opResponse : stateResponse
     return { status: 200, json: async () => body }
   }
-  return { win, registrations, storage, listeners, calls, fetchStub }
+  return { win, registrations, storage, listeners, calls, fetchStub, netResponse }
 }
 
 /**
@@ -634,4 +651,211 @@ test('client standalone：切走之后才回来的操作结果不能盖到新工
   )
   assert.ok(textOf(finalTree).includes('/tmp/ws-b'), '面板不能被旧工作区的状态切回去')
   assert.ok(textOf(finalTree).includes('dev'), '旧工作区的状态不能盖掉新工作区的状态')
+})
+
+// ── 6. 网络加速界面 ───────────────────────────────────────────────────────
+//
+// 这一节保的是「点了按钮真的有反应」和「渲染分支不白屏」：面板是新写的手绘
+// createElement，任何一处笔误都会让整个 shell.overlay 渲染抛异常 —— 表现是
+// Git 面板直接消失，而不是局部出错。
+
+/** 打开 🌐 网络加速折叠块。 */
+async function openNet(react) {
+  const before = await react.settle()
+  const globe = findButton(before, '🌐')
+  assert.ok(globe !== undefined, '头部应有 🌐 按钮')
+  assert.equal(typeof globe.props.onClick, 'function')
+  globe.props.onClick()
+  return react.settle()
+}
+
+test('client standalone：点 🌐 能展开加速设置，且渲染不抛异常', async () => {
+  const harness = makeFakeWindow()
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+
+  const tree = await openNet(react)
+  const text = textOf(tree)
+  assert.ok(text.includes('网络加速'), `展开后要看到设置块，实际：${text.slice(0, 200)}`)
+  assert.ok(text.includes('gh-proxy.com'), '镜像候选要列出来')
+  assert.ok(text.includes('检测网络'), '要有现场检测入口')
+  // 安全提示必须在，且要说明私有仓库该怎么办 —— 这是这个功能的取舍核心。
+  assert.ok(text.includes('第三方') && text.includes('私有仓库'))
+  assert.ok(findButton(tree, '保存代理') !== undefined)
+})
+
+test('client standalone：面板挂载时会读一次宿主配置', async () => {
+  const harness = makeFakeWindow({
+    netResponse: {
+      ok: true, mirrorEnabled: true, mirror: 'https://ghfast.top/',
+      proxy: 'http://***@127.0.0.1:7890', hasProxy: true,
+      candidates: [{ id: 'ghfast', label: 'ghfast.top', prefix: 'https://ghfast.top/' }],
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  const tree = await react.settle()
+
+  assert.ok(
+    harness.calls.fetch.some((call) => String(call.url).includes('/git-panel/net')),
+    '挂载时应读 /git-panel/net',
+  )
+  // 草稿框里应当是打码后的地址：真凭据永远不进浏览器。
+  const text = textOf(tree)
+  assert.ok(!text.includes('secret'))
+  const globe = findButton(tree, '🌐')
+  const opened = await (async () => { globe.props.onClick(); return react.settle() })()
+  const proxyInput = flattenTree(opened).find((node) => node.type === 'input' && String(node.props.value).includes('127.0.0.1:7890'))
+  assert.ok(proxyInput !== undefined, '代理输入框应预填宿主返回的（已打码）地址')
+  assert.ok(String(proxyInput.props.value).includes('***'), '回传的必须是打码串')
+})
+
+test('client standalone：保存代理会把输入框内容 POST 给 /git-panel/net', async () => {
+  const harness = makeFakeWindow()
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  const tree = await openNet(react)
+
+  const input = flattenTree(tree).find((node) => node.type === 'input' && String(node.props.placeholder).includes('本机代理'))
+  assert.ok(input !== undefined, '应有代理输入框')
+  input.props.onChange({ target: { value: 'http://127.0.0.1:7890' } })
+  const afterType = await react.settle()
+
+  const save = findButton(afterType, '保存代理')
+  assert.equal(typeof save.props.onClick, 'function', '保存按钮必须真的接上处理函数')
+  await save.props.onClick()
+  await react.settle()
+
+  // 只数打到 /git-panel/net 的 POST：/git-panel/diag 也是 POST，不能混进来。
+  const posted = harness.calls.fetch.filter((call) =>
+    String(call.url).includes('/git-panel/net') && call.init !== undefined && call.init.method === 'POST')
+  assert.equal(posted.length, 1, `应恰好 POST 一次，实际 ${posted.length} 次`)
+  assert.deepEqual(JSON.parse(posted[0].init.body), { proxy: 'http://127.0.0.1:7890' })
+})
+
+test('client standalone：宿主是旧版本、还没有 /git-panel/net 时，面板照常渲染并说明不可用', async () => {
+  // 这正是「客户端已热重载、宿主还没重启」时的真实状态：404 回的是 HTML，
+  // response.json() 会抛。读配置失败绝不能把整个面板带崩。
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: null,
+    ahead: 0, behind: 0, changes: [], log: [], remotes: [],
+  }
+  const harness = makeFakeWindow({ stateResponse: repoState })
+  const base = harness.fetchStub
+  harness.fetchStub = async (url, init = {}) => {
+    if (String(url).includes('/git-panel/net')) {
+      return {
+        status: 404,
+        json: async () => { throw new Error('Unexpected token < in JSON') },
+      }
+    }
+    return base(url, init)
+  }
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+
+  const tree = await react.settle()
+  assert.ok(textOf(tree).includes('main'), '读不到加速配置不影响仓库状态显示')
+  assert.ok(findButton(tree, '获取远程') !== undefined, '按钮照常在')
+
+  const opened = await openNet(react)
+  assert.ok(textOf(opened).includes('读不到宿主配置'), '要明确告诉用户是宿主版本的问题，而不是静默空白')
+  // 检测按钮不该在一个必然 404 的宿主上还让用户点。
+  assert.equal(findButton(opened, '检测网络'), undefined)
+})
+
+test('client standalone：点「检测网络」把各线路结果列出来（含失败的线路）', async () => {
+  const harness = makeFakeWindow({
+    probeResults: [
+      { kind: 'direct', label: '直连 github.com', ok: false, ms: 8000, error: '命令超时（8000ms 内无响应）' },
+      { kind: 'mirror', label: 'gh-proxy.com', ok: true, ms: 820, error: null },
+      { kind: 'mirror', label: 'ghfast.top', ok: true, ms: 1040, error: null },
+    ],
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  const tree = await openNet(react)
+
+  await findButton(tree, '检测网络').props.onClick()
+  const after = await react.settle()
+  const text = textOf(after)
+
+  assert.ok(harness.calls.fetch.some((call) => String(call.url).includes('probe=1')), '应请求 probe=1')
+  assert.ok(text.includes('ghfast.top'), '通的线路要列出来')
+  assert.ok(text.includes('820ms'), '通了的要显示耗时')
+  assert.ok(text.includes('直连 github.com'), '不通的线路也要列出来（否则用户不知道差别在哪）')
+  assert.ok(text.includes('✗'), '失败的线路要有明确标记')
+})
+
+test('client standalone：宿主判定是网络问题时自动展开加速设置，并把说明回显到结果栏', async () => {
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: null,
+    ahead: 0, behind: 0, changes: [], log: [], remotes: [],
+  }
+  const harness = makeFakeWindow({
+    stateResponse: repoState,
+    opResponse: {
+      ok: false, command: 'git fetch --all --prune', exitCode: 128,
+      stdout: '', stderr: "fatal: unable to access 'https://github.com/x/y': Recv failure: Connection was reset",
+      message: 'Recv failure: Connection was reset',
+      hint: '连不上远端（连接被重置 / 超时），国内直连 github.com 很常见。点面板右上角的 🌐 打开「网络加速」…',
+      network: true, accelerated: 'direct', notes: [],
+      state: repoState,
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+
+  const initial = await react.settle()
+  // 先确认设置块确实是收起的（不然下面那条断言会因为「本来就开着」而假通过）。
+  assert.equal(findButton(initial, '检测网络'), undefined, '初始状态加速设置应是收起的')
+
+  const fetchBtn = findButton(initial, '获取远程')
+  assert.ok(fetchBtn !== undefined, '仓库里应有「获取远程」按钮')
+  await fetchBtn.props.onClick()
+  const after = await react.settle()
+  const text = textOf(after)
+
+  // 断言「只有展开时才存在」的控件，而不是「网络加速」这四个字 —— 后者在提示
+  // 文案里也有（「点面板右上角的 🌐 打开「网络加速」」），拿它断言会假通过。
+  assert.ok(
+    findButton(after, '检测网络') !== undefined,
+    '网络失败要自动把加速设置展开，而不是只说「点 🌐」让用户自己找',
+  )
+  assert.ok(text.includes('Connection was reset'), '原始报错要保留，用户才能搜')
+  assert.ok(text.includes('连不上远端'), '要给出下一步提示')
+})
+
+test('client standalone：开了加速时，命令结果栏要说明这条命令走了哪条线路', async () => {
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: null,
+    ahead: 0, behind: 0, changes: [], log: [], remotes: [],
+  }
+  const harness = makeFakeWindow({
+    stateResponse: repoState,
+    opResponse: {
+      ok: true, command: 'git fetch --all --prune', exitCode: 0, stdout: '', stderr: '',
+      message: null, hint: null, network: false, accelerated: 'mirror',
+      notes: ['已通过镜像 gh-proxy.com 加速（只作用于本次命令，不改你的 git 配置）'],
+      state: repoState,
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  const initial = await react.settle()
+
+  await findButton(initial, '获取远程').props.onClick()
+  const after = await react.settle()
+  const bars = outputBars(after).join('\n')
+
+  // 走镜像 = 请求经过了第三方，用户必须看得见，不能在后台默默发生。
+  assert.ok(bars.includes('已通过镜像 gh-proxy.com'), `结果栏应说明走了镜像，实际：${JSON.stringify(outputBars(after))}`)
+  assert.ok(bars.includes('$ git fetch --all --prune'), '命令回显仍要在')
 })

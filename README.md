@@ -22,6 +22,7 @@ DSH（DeepSeek Harness）Git 面板插件：在界面右下角提供一个**纯�
 | 帮助（?） | 头部「?」在**新标签页打开独立帮助文档**（同源路由 `GET /git-panel/help`）：面板操作方式 + 分组常用 git 命令；**每条命令点一下即复制到剪贴板**。文档是普通网页——原生滚动、Ctrl+F 查找、可打印、可收藏，适合开着边看边敲 |
 | 切换 / 刷新 | 换一个目录操作 / 重新读取状态 |
 | 跟随会话 | 手动切过目录后，一键回到当前会话的工作目录 |
+| 网络加速（🌐） | 连不上 github.com（`Connection was reset` / 超时）时打开：克隆/获取/拉取可走第三方镜像，全部操作可走本机代理。见 [网络加速](#网络加速连不上-github) |
 
 面板同时展示：当前分支、上游跟踪状态（领先/落后几个提交）、远程地址、
 改动清单（文件级，可点开看 diff）、最近 8 次提交、每条命令的执行结果。
@@ -41,6 +42,80 @@ DSH（DeepSeek Harness）Git 面板插件：在界面右下角提供一个**纯�
 
 这些判断都在宿主侧完成（`classifyPushFailure` / `recoverPush`），面板只负责显示，
 因此 AI 工具走同一条逻辑。
+
+**网络类失败单独一条路**：连接被重置 / 超时不属于上面任何一类（`classifyPushFailure`
+对它们只会返回 `none`——它的判断依据是「服务器答复了什么」，而链路根本没通）。
+所以 `classifyNetworkFailure` 先兜这一类，命中的话面板会**自动展开网络加速设置**
+并给出下一步。判断时刻意排除了 `The requested URL returned error: 404` 这类
+「服务器答复了」的报错——那是仓库不存在，把用户引去开加速只会更迷惑。
+
+## 网络加速（连不上 GitHub）
+
+国内直连 `github.com` 经常连不上，典型报错：
+
+```
+fatal: unable to access 'https://github.com/<owner>/<repo>.git/':
+Recv failure: Connection was reset
+```
+
+或干脆一直挂到超时。面板右上角的 **🌐** 提供两级加速，**可叠加**：
+
+| 方式 | 作用于 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| 镜像 | `clone` / `fetch` / `pull`（只读） | **关闭** | 请求转给第三方镜像（`gh-proxy.com` / `ghproxy.net` / `ghfast.top`，可换） |
+| 代理 | 全部联网操作，**含 `push`** | 关闭 | 填本机代理，如 `http://127.0.0.1:7890`（Clash / V2Ray 等） |
+
+「检测网络」按钮会在这台机器上**现场实测**每条线路（直连 + 各镜像 + 你填的代理），
+把通不通、耗时多少直接列出来——所以文档里不写「哪个镜像快」，以你机器上的实测为准。
+
+### 三个关键实现细节
+
+1. **不改你的任何 git 配置。** 加速通过 `git -c …` 注入到**单条命令**上，既不写
+   `~/.gitconfig` 也不写仓库 `.git/config`。关掉开关就等于什么都没发生过；终端里
+   自己敲的 git 完全不受影响（想给终端也加速，用帮助文档里给的
+   `git config --global http.proxy …`）。
+2. **镜像走 `insteadOf`，不会污染仓库。** 命令形如：
+
+   ```
+   git -c url.https://gh-proxy.com/https://github.com/.insteadOf=https://github.com/ fetch --all --prune
+   ```
+
+   实测 `git clone` 之后 `origin` 里存的**仍然是原始 github URL**——git 只在传输层
+   重写地址。注意 base 必须是「镜像 + 原前缀」这种拼法：`insteadOf` 做的是**前缀
+   替换**，写成 `url.<镜像>.insteadOf=<原前缀>` 会拼出 `https://gh-proxy.com/owner/repo`
+   这种并不存在的地址，而且不报错、直接挂到超时。
+3. **镜像失败自动回退直连。** 镜像不是官方线路，随时可能失效；「开了加速反而连不上」
+   是最糟的体验。所以镜像那一次失败（非零退出）就立刻用**不带镜像的原命令**再跑一遍，
+   并把这件事写进结果栏。只会回退一次，不会来回折腾。
+
+   镜像那次额外带 `http.lowSpeedLimit=1000` / `http.lowSpeedTime=60`：60 秒内几乎
+   没有数据就主动中断，不至于让用户干等满 10 分钟才回退；**回退的直连那次不带**，
+   免得误杀一个只是慢、但确实在下载的大仓库。
+
+### 安全取舍（重要）
+
+**镜像默认关闭，这是有意的。** 走镜像意味着你的请求经过第三方：私有仓库的内容、
+以及需要认证时携带的凭据，对镜像运营方都是可见的。所以插件不替你默认打开。
+
+- 公开仓库 → 开镜像最省事。
+- **私有仓库 / 需要 `push`** → 用代理，别用镜像。`push` 永远不走镜像（`insteadOf`
+  会连认证主体一起改写，必然失败），这是代码里写死的。
+- 面板回显与 `GET /git-panel/net` 返回的代理地址**一律打码**（`http://***@host:7890`），
+  明文凭据不回显、不进浏览器、不进命令回显、不进模型工具输出。面板把打码串原样回传时，
+  宿主理解为「不变」，不会用 `***` 覆盖掉真凭据。
+
+配置落在 `$DSH_HOME/git-panel-net.json`（纯 JSON，删掉即恢复默认）：
+
+```json
+{
+  "mirrorEnabled": false,
+  "mirror": "https://gh-proxy.com/",
+  "proxy": ""
+}
+```
+
+写这个接口的 `POST /git-panel/net` 带同源校验——它决定 git 命令**怎么执行**，
+能被跨站改写就等于把仓库流量导向别处。
 
 **设置开关**：设置 → 通用 → 「Git 面板」，一键开启/关闭。状态记在浏览器
 `localStorage`（key: `dsh-git-panel-enabled`），默认开启。
@@ -120,9 +195,14 @@ dsh plugin --profile web remove dsh-git-panel
 dsh-git-panel/            # 插件包本体（link 安装指向这里）
 ├── package.json          # dsh.bundle.patch / dsh.client 声明
 ├── cordis.patch.yml      # bundle patch：把本插件插入 profile 配置树
-└── lib/
-    ├── index.js          # Host half：HTTP 路由 /git-panel/state|op|diag|help + 13 个 git 模型工具
-    └── client.js         # Client half：shell.overlay 面板 + settings.general.item 开关
+├── lib/
+│   ├── index.js          # Host half：HTTP 路由 /git-panel/state|op|net|diag|help + 13 个 git 模型工具
+│   └── client.js         # Client half：shell.overlay 面板 + settings.general.item 开关
+└── test/                 # node --test，不随包发布（package.json 的 files 里没有它）
+    ├── unit.test.mjs     # 宿主纯函数
+    ├── standalone.test.mjs # 零依赖加载 / 注册契约
+    ├── client.test.mjs   # 客户端 bundle（假 window + 假 React）
+    └── network.test.mjs  # 网络加速整条链路（含假 git 离线复现「镜像挂、直连通」）
 ```
 
 ## 设计说明
@@ -191,6 +271,10 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
     defaultDir: /home/me/project   # 缺省操作目录；留空 = 跟随当前会话工作目录
 ```
 
+网络加速（镜像 / 代理）**不走这里**，而是 `$DSH_HOME/git-panel-net.json`，由面板的
+🌐 按钮读写 —— 那个设置要能随时改，不该逼用户编辑 yml 再重启。删掉该文件即恢复默认
+（不加速）。
+
 ## 安全边界（部署时注意）
 
 面板路由 `/git-panel/*` **没有独立鉴权**，执行类请求只校验 `Origin` 同源。
@@ -201,12 +285,21 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
   只要能在 HTTP 头里伪造 `Origin`，就能调用这些接口执行
   `git clone / pull / push / commit` 等操作。
 
+`/git-panel/net` 也在这个范围内，分两种情况：
+
+- `GET` 读配置、`GET ?probe=1` 现场探测各线路。**代理地址一律打码**后才返回
+  （`http://***@host:7890`），明文凭据不回显、不进浏览器；但「设过代理」这个事实、
+  以及探测各线路通不通的结果，局域网内是可见的。
+- `POST` 保存配置**带同源校验**，因为该接口决定 git 命令**怎么执行** —— 被跨站
+  改写就等于把仓库流量导向别处。这里的 `Origin` 校验和上面一样，是可伪造的，
+  别把它当鉴权。
+
 结论：**把 Git 面板和「对局域网开放 web 端口」分开考虑**；确实需要对局域网开放时，
 请用 DSH 的配对 / 鉴权层限制访问，或让 `webserver.host` 保持回环。
 
-## 开发注记（四个真踩过的坑）
+## 开发注记（五个真踩过的坑）
 
-写这类界面插件时，下面四点都会让功能**静默失败或半成功、且不报任何错**，值得记下来：
+写这类界面插件时，下面这些坑都会让功能**静默失败或半成功、且不报任何错**，值得记下来：
 
 1. **不能只靠 `ctx.slots.inject(name, cb)` 注册界面。**
    它的语义是「声明事件上回调」；当前实现订阅后确实会立刻 reconcile 一次，但这个
@@ -251,6 +344,26 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
    注意**不能把清理挂在「目录变了」上**：克隆成功后也会换目录，但那时输出正是用户要看
    的克隆结果。回归测试见 `test/client.test.mjs` 第 5 节。
 
+5. **给 git 注入配置参数时，`-c` 必须和 `key=value` 一起生成。**
+   网络加速要把一组配置只作用于单条命令，于是有了 `networkExtraArgs()`。最初它返回的是
+   裸的 `['url.…insteadOf=…', 'http.proxy=…']`，指望各个调用点自己拼上 `-c` —— 结果是
+   **每个调用点都忘了拼**。git 收到 `git url.…insteadOf=… fetch …` 时会把第一个参数当成
+   **子命令**，报一句「'url.…' 不是一个 git 命令」，然后整个加速静默失效、每次都退回直连。
+   这个坑的教训有两层：
+
+   - 代码上：**把 `-c` 收进生成函数内部**，返回可直接展开的完整片段，调用方就没有拼错的
+     机会。比「约定调用方记得加」可靠得多。
+   - 测试上：原来的断言只查**内容**（「参数里有没有 `insteadOf`」），查不出**形状**错误。
+     现在补了两道：一道断言片段必须成对的 `-c key=value`，一道直接**拿真 git 跑一遍**
+     （`git <片段> config --get http.lowSpeedTime` 必须回 `60`，而不是「不是一个 git 命令」）。
+     缺 git 的机器会自动跳过这一道。
+
+   顺带一提，这个 bug 是**把 `apply()` 真跑起来、对着真 GitHub 发一次 fetch** 才暴露的：
+   假 git 只管把参数记下来，不看 git 认不认。而且它当时有**两个入口**——「检测网络」里的
+   代理那条也是手写的裸 `key=value`，症状是代理永远显示成一句看不懂的失败。所以修法不只是
+   补 `-c`，而是让探测**复用同一个生成函数**（`probeJobs` 调 `networkExtraArgs`），
+   把「能写错的地方」从两处减到零处。回归测试见 `test/network.test.mjs`。
+
 ### 客户端诊断日志
 
 界面注册类问题在浏览器控制台里对用户不可见，因此客户端会把注册过程回报到宿主：
@@ -269,19 +382,22 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
 决策、clone 目标名、目录归一化），用 Node 自带测试框架覆盖：
 
 ```bash
-npm test        # node --test：65 个用例，毫秒级完成
+npm test        # node --test：105 个用例，毫秒级完成（唯一需要 git 的那道会自行跳过）
 npm run check   # 语法检查（index.js + client.js）
 ```
 
-其中两个文件专门验证「**独立运行**」，不需要 DSH、不需要装任何东西：
+其中三个文件专门验证「**独立运行**」，不需要 DSH、不需要装任何东西、也不联网：
 
 | 文件 | 验证什么 |
 | --- | --- |
 | `test/standalone.test.mjs` | 用 mock ctx 把宿主半边跑一遍：`import` 不抛异常；`apply()` 在「服务就绪 / 稍后就绪 / 都缺 / ctx 被裁剪」四种情况下都不抛；卸载能清空路由与工具；13 个工具的 `parameters` 都落在 harness 支持的 JSON Schema 子集内（用了 `anyOf` / `$ref` / `format` 之类会让 `tools.register` 抛错、工具静默全丢） |
-| `test/client.test.mjs` | 用假 window + 假 React 把客户端 bundle 求值一遍：bundle 格式与 id 正确；**只 require `react` 这一个种子模块**（多 require 别的就说明依赖了构建产物）；导出 `apply` + `inject: ['slots']`；`slots` 缺失 / 直接注册成功 / 稍后声明三种时机都不抛；注册失败会把真实原因回报；组件在 props 缺失时也能渲染（slot 契约变化不白屏）；点改动看 diff 能走到终态（用**有状态**的假 React 真重渲染，不会停在「加载中…」）；**切换工作区后命令结果栏 / diff / 状态都属于新工作区**（旧仓库的瞬时结果被清掉，切走之后才回来的操作结果被丢弃） |
+| `test/client.test.mjs` | 用假 window + 假 React 把客户端 bundle 求值一遍：bundle 格式与 id 正确；**只 require `react` 这一个种子模块**（多 require 别的就说明依赖了构建产物）；导出 `apply` + `inject: ['slots']`；`slots` 缺失 / 直接注册成功 / 稍后声明三种时机都不抛；注册失败会把真实原因回报；组件在 props 缺失时也能渲染（slot 契约变化不白屏）；点改动看 diff 能走到终态（用**有状态**的假 React 真重渲染，不会停在「加载中…」）；**切换工作区后命令结果栏 / diff / 状态都属于新工作区**（旧仓库的瞬时结果被清掉，切走之后才回来的操作结果被丢弃）；网络加速设置块能展开、能保存、检测结果能列出，且网络失败时会自动展开 |
+| `test/network.test.mjs` | 网络加速整条链路：配置归一化（含「只打开开关就该生效」这个踩过的坑）、`insteadOf` 的 base 拼法、push 不走镜像、`noMirror` 回退参数、凭据打码（GET 视图 / 命令回显 / 工具输出三处都不能漏）、失败分类（用户那条真实报错要认出来，404 不能被当成网络问题）、配置落盘与合并、`/git-panel/net` 三种方法 + 跨站拒绝 + 打码串回传语义；最后用**假 git 放到 PATH 最前面**离线复现「镜像挂、直连通」，验证自动回退确实发生、且结果栏会说明这件事 |
 
-> 这两个文件是**换机器、换 DSH 版本时的第一道回归**：`npm test` 过了，说明插件
+> 这几个文件是**换机器、换 DSH 版本时的第一道回归**：`npm test` 过了，说明插件
 > 自身的加载与注册契约没变；剩下的只是 DSH 侧服务是否提供（缺了就优雅降级）。
+> 网络加速那部分刻意全部做成**离线**验证：真的去连 github 会让测试结果随网络环境
+> 变化，那种测试在有网和没网的机器上给出的信号完全不同。
 
 ## License
 

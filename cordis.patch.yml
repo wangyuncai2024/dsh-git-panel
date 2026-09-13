@@ -6,13 +6,19 @@
 #
 # 安装：
 #   cd <插件根目录> && dsh plugin --profile web add "link:$PWD"
-#   # 然后把 "dsh-git-panel" 加进 profile package.json 的 dsh.profile.bundles
+#   # 不需要手改 profile 的 package.json：dsh plugin 会把依赖写进 profile，
+#   # 并把「声明了 dsh.bundle.patch 的依赖」自动登记进 dsh.profile.bundles
+#   #（dsh plugin 的 reconcilePlugins；卸载时同样会自动移除）。
+#   # bundles 是启动时读取的，所以首次安装 / 卸载后要重启一次 dsh。
 #
 # 卸载：
 #   dsh plugin --profile web remove dsh-git-panel
 #
 # 可用行配置（在 profile 的 cordis.patch.yml 里用同一个 id 覆盖）：
 #   defaultDir: ''   # 面板默认操作的目录；留空 = 跟随当前会话工作目录
+#
+# 注：网络加速（镜像 / 代理）不走这里，见 $DSH_HOME/git-panel-net.json —— 面板的 🌐
+# 按钮读写它；那个设置要能随时改，不该逼用户回来编辑本文件再重启。
 - insert:
     - id: git-panel
       name: 'dsh-git-panel'

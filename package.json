@@ -1,14 +1,16 @@
 {
   "name": "dsh-git-panel",
-  "version": "0.7.0",
-  "description": "DSH Git 面板插件：在界面右下角提供一个纯点击的 Git 图形面板（状态/暂存/提交/分支管理/改动 diff/最近提交/拉取/推送/初始化/克隆），帮助内容为宿主提供的独立 HTML 文档（新标签页打开，命令点一下即复制），并在「设置 → 通用」里提供开关。宿主半边用 Node 内置 child_process 以参数数组方式执行 git（无 shell 注入面），客户端半边走同源 HTTP /git-panel/* 与宿主通信。",
+  "version": "0.8.0",
+  "description": "DSH Git 面板插件：在界面右下角提供一个纯点击的 Git 图形面板（状态/暂存/提交/分支管理/改动 diff/最近提交/拉取/推送/初始化/克隆），帮助内容为宿主提供的独立 HTML 文档（新标签页打开，命令点一下即复制），并在「设置 → 通用」里提供开关。内置网络加速：连不上 github.com 时可用第三方镜像（只读操作）或本机代理，通过 git -c 只作用于单条命令、不改用户任何 git 配置，镜像失败自动回退直连。宿主半边用 Node 内置 child_process 以参数数组方式执行 git（无 shell 注入面），客户端半边走同源 HTTP /git-panel/* 与宿主通信。",
   "keywords": [
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
     "git",
     "panel",
-    "cordis"
+    "cordis",
+    "proxy",
+    "mirror"
   ],
   "type": "module",
   "main": "lib/index.js",
