@@ -1,6 +1,6 @@
 {
   "name": "dsh-git-panel",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "DSH Git 面板插件：在界面右下角提供一个纯点击的 Git 图形面板（状态/暂存/提交/分支管理/改动 diff/最近提交/拉取/推送/初始化/克隆），附带可移动可拉伸的帮助窗口（操作方式 + 可复制命令），并在「设置 → 通用」里提供开关。宿主半边用 Node 内置 child_process 以参数数组方式执行 git（无 shell 注入面），客户端半边走同源 HTTP /git-panel/* 与宿主通信。",
   "keywords": [
     "dsh",
