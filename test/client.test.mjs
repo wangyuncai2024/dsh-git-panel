@@ -9,7 +9,10 @@
 //   3. 只导出 apply / inject 两个契约字段，且 inject 声明了 slots；
 //   4. 界面注册在三种时机下都不抛异常：slots 服务缺失 / 直接注册成功 /
 //      插槽尚未声明需等待（含「真实错误不被吞掉」的区分）；
-//   5. 两个组件都能渲染（含 props 缺失——将来 slot 契约变了也不能白屏）。
+//   5. 两个组件都能渲染（含 props 缺失——将来 slot 契约变了也不能白屏）；
+//   6. 点改动看 diff 能走到终态（真状态重渲染），不会永远停在「加载中…」——
+//      这一条是回归测试：runOp 曾把结果变量声明在 try 块里，每次调用都以
+//      ReferenceError 结束，宿主侧 git 明明执行成功了，调用方却永远拿不到返回值。
 // ============================================================================
 
 import test from 'node:test'
@@ -51,8 +54,112 @@ function makeFakeReact() {
   }
 }
 
-// ── 假 window：只提供 bundle 真正用到的面 ────────────────────────────────────
+/**
+ * 有状态的假 React：真的保存 hook 值，并在 setState 之后重渲染组件。
+ *
+ * `makeFakeReact` 只记录 setState 的值、不重渲染，够验「渲染不白屏」；
+ * 但验不了「点一下之后状态有没有走到终态」——而「点改动看 diff 永远停在
+ * 加载中」正是这种形态：异常发生在 await 之后，界面停在中间态。
+ */
+function makeStatefulReact() {
+  let component = null
+  let props = null
+  let hooks = []
+  let cursor = 0
+  let tree = null
+  let dirty = false
+  const pendingEffects = []
 
+  const api = {
+    createElement: (type, elementProps, ...children) => ({
+      type,
+      props: elementProps === null || elementProps === undefined ? {} : elementProps,
+      children,
+    }),
+    useState: (initial) => {
+      const index = cursor++
+      if (!Object.hasOwn(hooks, index)) hooks[index] = typeof initial === 'function' ? initial() : initial
+      const set = (value) => {
+        const next = typeof value === 'function' ? value(hooks[index]) : value
+        if (Object.is(next, hooks[index])) return
+        hooks[index] = next
+        dirty = true
+      }
+      return [hooks[index], set]
+    },
+    useRef: (initial) => {
+      const index = cursor++
+      if (!Object.hasOwn(hooks, index)) hooks[index] = { current: initial }
+      return hooks[index]
+    },
+    // deps 比较复刻 React：引用相等即不重跑，避免 effect 里的 setState 打转。
+    useEffect: (callback, deps) => {
+      const index = cursor++
+      const previous = hooks[index]
+      const changed = previous === undefined
+        || deps === undefined
+        || deps.length !== previous.length
+        || deps.some((value, at) => !Object.is(value, previous[at]))
+      hooks[index] = deps
+      if (changed) pendingEffects.push(callback)
+    },
+    useCallback: (callback) => callback,
+    useMemo: (factory) => factory(),
+    Fragment: 'Fragment',
+  }
+
+  function renderOnce() {
+    cursor = 0
+    tree = component(props)
+    for (const effect of pendingEffects.splice(0)) effect()
+    return tree
+  }
+
+  return {
+    api,
+    mount(component_, props_) {
+      component = component_
+      props = props_
+      hooks = []
+      cursor = 0
+      dirty = false
+      pendingEffects.length = 0
+      renderOnce()
+    },
+    /** 反复渲染直到没有新的 setState / effect（让 await 链跑完），返回最终树。 */
+    async settle(rounds = 12) {
+      for (let round = 0; round < rounds; round += 1) {
+        dirty = false
+        renderOnce()
+        await new Promise((resolve) => { setTimeout(resolve, 0) })
+        if (!dirty && pendingEffects.length === 0) return tree
+      }
+      return tree
+    },
+  }
+}
+
+/** 深度展开假 React 的元素树（children 里可能嵌数组）。 */
+function flattenTree(node, out = []) {
+  if (node === null || node === undefined || typeof node !== 'object') return out
+  if (Array.isArray(node)) {
+    for (const child of node) flattenTree(child, out)
+    return out
+  }
+  out.push(node)
+  if (Array.isArray(node.children)) for (const child of node.children) flattenTree(child, out)
+  return out
+}
+
+/** 取一个元素子树的纯文本。 */
+function textOf(node) {
+  if (node === null || node === undefined) return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(textOf).join('')
+  return (node.children ?? []).map(textOf).join('')
+}
+
+// ── 假 window：只提供 bundle 真正用到的面 ────────────────────────────────────
 function makeFakeWindow(options = {}) {
   const registrations = []
   const storage = new Map()
@@ -73,19 +180,19 @@ function makeFakeWindow(options = {}) {
     dispatchEvent: () => true,
     confirm: () => true,
   }
+  const stateResponse = options.stateResponse ?? {
+    ok: true, dir: '/tmp/demo', isRepo: false, branch: null, upstream: null,
+    ahead: 0, behind: 0, changes: [], log: [], remotes: [], notice: '不是仓库',
+  }
+  const opResponse = options.opResponse ?? stateResponse
   const fetchStub = async (url, init = {}) => {
     calls.fetch.push({ url, init })
     if (String(url).includes('/git-panel/diag')) {
       calls.diag.push(JSON.parse(init.body))
       return { status: 200, json: async () => ({ ok: true }) }
     }
-    return {
-      status: 200,
-      json: async () => ({
-        ok: true, dir: '/tmp/demo', isRepo: false, branch: null, upstream: null,
-        ahead: 0, behind: 0, changes: [], log: [], remotes: [], notice: '不是仓库',
-      }),
-    }
+    const body = String(url).includes('/git-panel/op') ? opResponse : stateResponse
+    return { status: 200, json: async () => body }
   }
   return { win, registrations, storage, listeners, calls, fetchStub }
 }
@@ -314,4 +421,82 @@ test('client standalone：localStorage 不可用（隐私模式）也不崩', ()
   assert.doesNotThrow(() => exports.apply({ slots }))
   const toggle = registered.find((entry) => entry.options.name === 'settings.general.item').component
   assert.doesNotThrow(() => renderComponent(harness, react, toggle, undefined))
+})
+
+// ── 4. 回归：点改动看 diff 必须走到终态 ─────────────────────────────────────
+
+test('client standalone：点改动看 diff 不会停在「加载中…」（runOp 必须把结果返回给调用方）', async () => {
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: 'origin/main',
+    ahead: 0, behind: 0,
+    changes: [{ code: ' M', path: 'a.txt', staged: false }],
+    log: [], remotes: [],
+  }
+  const harness = makeFakeWindow({
+    stateResponse: repoState,
+    opResponse: { ok: true, diff: 'diff --git a/a.txt b/a.txt\n@@ -1 +1,2 @@\n one\n+two\n', state: repoState },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  const { slots, registered } = makeSlots()
+  exports.apply({ slots })
+  const panel = registered.find((entry) => entry.options.name === 'shell.overlay').component
+
+  react.mount(panel, {
+    useSessions: (selector) => selector({ current: 's1', byId: { s1: { cwd: '/tmp/demo' } } }),
+  })
+  const initial = await react.settle()
+
+  const clickable = flattenTree(initial).find((node) =>
+    typeof node.props.title === 'string' && node.props.title.includes('点击查看 diff'))
+  assert.ok(clickable !== undefined, '改动清单里应出现可点击的条目（先要拿到仓库状态）')
+
+  // 修复前的形态：runOp 里 `const data` 声明在 try 块内、却用 `return data` 在
+  // try 之外返回，每次调用都以 ReferenceError 结束 —— 于是这个 onClick 的
+  // promise 直接 reject，await 之后的 setDiffText 永远不执行，界面停在中间态。
+  await assert.doesNotReject(
+    () => clickable.props.onClick(),
+    '点 diff 的处理函数不能以异常结束，否则 diff 区永远停在「加载中…」',
+  )
+
+  const finalTree = await react.settle()
+  const pres = flattenTree(finalTree).filter((node) => node.type === 'pre').map(textOf)
+  assert.ok(!pres.includes('加载中…'), 'diff 区不能停在「加载中…」')
+  assert.ok(pres.some((text) => text.includes('+two')), `diff 区应显示真实 diff，实际拿到：${JSON.stringify(pres)}`)
+})
+
+test('client standalone：runOp 失败时调用方拿到 ok:false（而不是 undefined 导致「未知错误」）', async () => {
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: null,
+    ahead: 0, behind: 0,
+    changes: [{ code: ' M', path: 'a.txt', staged: false }],
+    log: [], remotes: [],
+  }
+  const harness = makeFakeWindow({ stateResponse: repoState })
+  // 让 /git-panel/op 直接抛（网络层失败），走 runOp 的 catch 分支。
+  const failing = harness.fetchStub
+  harness.fetchStub = async (url, init) => {
+    if (String(url).includes('/git-panel/op')) throw new Error('HTTP 500')
+    return failing(url, init)
+  }
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  const { slots, registered } = makeSlots()
+  exports.apply({ slots })
+  const panel = registered.find((entry) => entry.options.name === 'shell.overlay').component
+  react.mount(panel, {
+    useSessions: (selector) => selector({ current: 's1', byId: { s1: { cwd: '/tmp/demo' } } }),
+  })
+  const initial = await react.settle()
+  const clickable = flattenTree(initial).find((node) =>
+    typeof node.props.title === 'string' && node.props.title.includes('点击查看 diff'))
+  assert.ok(clickable !== undefined)
+
+  await assert.doesNotReject(() => clickable.props.onClick())
+  const finalTree = await react.settle()
+  const pres = flattenTree(finalTree).filter((node) => node.type === 'pre').map(textOf)
+  assert.ok(
+    pres.some((text) => text.includes('查看 diff 失败：HTTP 500')),
+    `失败原因要原样回报，而不是「未知错误」：${JSON.stringify(pres)}`,
+  )
 })

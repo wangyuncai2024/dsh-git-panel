@@ -60,14 +60,41 @@ AI 说「帮我提交」即可。其中 `git_remote` 的 `action=set` 就是「�
 
 ## 安装（link 方式，本地开发）
 
+`link:` 让 profile 直接指向插件源码目录：改完代码按下表生效，不用重装。
+（裸写目录路径 pnpm 也会规范成 `link:`，两种写法等价；显式写 `link:` 只是把语义钉死。）
+
+**Linux / macOS**
+
 ```bash
 # 1) link 安装：dsh plugin 会把依赖写进 profile 的 package.json，
 #    并自动把 "dsh-git-panel" 登记进 dsh.profile.bundles（实测无需手改）
-dsh plugin --profile web add link:/home/wangyuncai/DSH-project/GitHub插件
+cd /path/to/dsh-git-panel                     # 换成你的插件根目录
+dsh plugin --profile web add "link:$PWD"      # 等价于 link:/该目录的绝对路径
 
 # 2) 重启 dsh 使新 bundle 生效（首次安装：bundles 在启动时读取）
 #    在运行 dsh 的终端按 Ctrl+C，然后重新执行：dsh web
 ```
+
+**Windows（PowerShell / cmd 通用）**
+
+```powershell
+# 路径用正斜杠 /，不要用反斜杠 \：
+# cmd.exe 把 \ 当转义符，写成 link:C:\Users\... 会被吞字符
+# 路径加引号，防空格与 shell 元字符
+dsh plugin --profile web add "link:C:/path/to/dsh-git-panel"   # 换成你的插件根目录
+
+# 然后 Ctrl+C 停掉 dsh，重新执行：dsh web
+```
+
+判断装成功了没有，两个都满足才算：
+
+- 输出是 `+ dsh-git-panel link:...`，**不是** `+ @deepseek-ai/dsh-root link:...`；
+- 没有 `declares no dsh.bundle` 这句警告。
+
+Windows 上最容易踩的坑：**先 `cd` 进插件根目录再执行**（或像上面直接用绝对路径）。
+`dsh plugin` 只对 `.`、`..` 这类相对路径做锚定，锚定依据是**你执行 dsh 时所在的目录**——
+在 DSH 部署根目录里跑 `dsh plugin add .`，pnpm 链接的是部署根本身（包名
+`@deepseek-ai/dsh-root`，没有 `dsh.bundle`），结果只是警告一句然后什么都不生效。
 
 > 提示：**首次安装/卸载**确实要重启一次（`dsh.profile.bundles` 与 patch 在启动时读取），
 > 官方插件市场装完同样提示「待重启生效」。重启后浏览器刷新页面即可，会话记录不会丢失。
@@ -90,7 +117,7 @@ dsh plugin --profile web remove dsh-git-panel
 ## 结构
 
 ```
-GitHub插件/               # 本工作区根目录 = 插件包本体（link 安装指向这里）
+dsh-git-panel/            # 插件包本体（link 安装指向这里）
 ├── package.json          # dsh.bundle.patch / dsh.client 声明
 ├── cordis.patch.yml      # bundle patch：把本插件插入 profile 配置树
 └── lib/
@@ -177,9 +204,9 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
 结论：**把 Git 面板和「对局域网开放 web 端口」分开考虑**；确实需要对局域网开放时，
 请用 DSH 的配对 / 鉴权层限制访问，或让 `webserver.host` 保持回环。
 
-## 开发注记（两个真踩过的坑）
+## 开发注记（三个真踩过的坑）
 
-写这类界面插件时，下面两点都会让功能**静默消失、且不报任何错**，值得记下来：
+写这类界面插件时，下面三点都会让功能**静默失败或半成功、且不报任何错**，值得记下来：
 
 1. **不能只靠 `ctx.slots.inject(name, cb)` 注册界面。**
    它的语义是「声明事件上回调」；当前实现订阅后确实会立刻 reconcile 一次，但这个
@@ -194,6 +221,20 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
    `apply()` 执行时 `ctx.get('tools')` 常常还是 `undefined`；只读一次就永远错过，
    13 个 git 工具会全部不注册。本插件对两者都做「现有实例优先、取不到就
    `ctx.inject([...], cb)` 等服务就绪」，两者都缺时也只是降级、不影响加载。
+
+3. **`try` 块里声明的变量，别在 `try` 外面返回。**
+   面板的 `runOp()` 是「所有 git 操作的唯一出口」，它必须先 `await` 拿结果、
+   再统一回显与刷新状态，所以结构上是 `try { const data = await postOp(...) }
+   catch { ... }` + `return data`。而 `const` 是块级作用域，`return data` 在
+   `try` 之外根本看不到它 —— **每次调用都以 `ReferenceError` 结束**。
+   这个 bug 的形态特别值得记住，因为它**看起来像功能正常**：`setOutput()` /
+   `setSnapshot()` 都在 `try` 内部，所以 git 操作确实执行了、状态条也确实刷新了，
+   只有「需要拿到返回值的调用方」坏掉 —— 点改动看 diff 永远停在「加载中…」、
+   分支管理器列不出分支、推送失败的自愈提示不出现，控制台里只有一个没人看的
+   unhandled rejection。
+   修法是 `let data` 声明在 `try` 外、`try` 里赋值；顺便在 `catch` 里把它归一化成
+   `{ ok: false, message }`，这样调用方统一按 `data.ok` 判断，失败原因是真实错误
+   而不是一句「未知错误」。回归测试见 `test/client.test.mjs` 第 4 节。
 
 ### 客户端诊断日志
 
@@ -213,7 +254,7 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
 决策、clone 目标名、目录归一化），用 Node 自带测试框架覆盖：
 
 ```bash
-npm test        # node --test：61 个用例，毫秒级完成
+npm test        # node --test：63 个用例，毫秒级完成
 npm run check   # 语法检查（index.js + client.js）
 ```
 
@@ -222,7 +263,7 @@ npm run check   # 语法检查（index.js + client.js）
 | 文件 | 验证什么 |
 | --- | --- |
 | `test/standalone.test.mjs` | 用 mock ctx 把宿主半边跑一遍：`import` 不抛异常；`apply()` 在「服务就绪 / 稍后就绪 / 都缺 / ctx 被裁剪」四种情况下都不抛；卸载能清空路由与工具；13 个工具的 `parameters` 都落在 harness 支持的 JSON Schema 子集内（用了 `anyOf` / `$ref` / `format` 之类会让 `tools.register` 抛错、工具静默全丢） |
-| `test/client.test.mjs` | 用假 window + 假 React 把客户端 bundle 求值一遍：bundle 格式与 id 正确；**只 require `react` 这一个种子模块**（多 require 别的就说明依赖了构建产物）；导出 `apply` + `inject: ['slots']`；`slots` 缺失 / 直接注册成功 / 稍后声明三种时机都不抛；注册失败会把真实原因回报；组件在 props 缺失时也能渲染（slot 契约变化不白屏） |
+| `test/client.test.mjs` | 用假 window + 假 React 把客户端 bundle 求值一遍：bundle 格式与 id 正确；**只 require `react` 这一个种子模块**（多 require 别的就说明依赖了构建产物）；导出 `apply` + `inject: ['slots']`；`slots` 缺失 / 直接注册成功 / 稍后声明三种时机都不抛；注册失败会把真实原因回报；组件在 props 缺失时也能渲染（slot 契约变化不白屏）；点改动看 diff 能走到终态（用**有状态**的假 React 真重渲染，不会停在「加载中…」） |
 
 > 这两个文件是**换机器、换 DSH 版本时的第一道回归**：`npm test` 过了，说明插件
 > 自身的加载与注册契约没变；剩下的只是 DSH 侧服务是否提供（缺了就优雅降级）。

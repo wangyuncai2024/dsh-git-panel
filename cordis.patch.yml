@@ -5,7 +5,7 @@
 # 这一层把本插件插入 Web profile 的配置树。
 #
 # 安装：
-#   dsh plugin --profile web add link:/home/wangyuncai/DSH-project/GitHub插件
+#   cd <插件根目录> && dsh plugin --profile web add "link:$PWD"
 #   # 然后把 "dsh-git-panel" 加进 profile package.json 的 dsh.profile.bundles
 #
 # 卸载：
