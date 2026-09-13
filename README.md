@@ -19,7 +19,7 @@ DSH（DeepSeek Harness）Git 面板插件：在界面右下角提供一个**纯�
 | 远程 / 配置 | 查看或修改推送目标（`git remote add` / `set-url`） |
 | 分支管理 | 打开后列出本地分支：点名字**切换**、输入名字**新建并切换**、按钮**安全删除**（未合并的分支会被拒绝，防误删历史） |
 | 改动点开看 diff | 改动清单里点任意条目，直接在面板里看它的 diff；已暂存条目看的是暂存区版本，再点一次收起 |
-| 帮助（?） | 弹出一个**可移动、可拉伸、可滚动的独立窗口**：面板操作方式 + 分组常用 git 命令；**每条命令点一下即复制到剪贴板**；拖标题栏移动、拖右下角手柄调整大小，内容超出时窗口内鼠标滚轮滚动，位置与尺寸都会被记住，打开后也可随时关闭 |
+| 帮助（?） | 头部「?」在**新标签页打开独立帮助文档**（同源路由 `GET /git-panel/help`）：面板操作方式 + 分组常用 git 命令；**每条命令点一下即复制到剪贴板**。文档是普通网页——原生滚动、Ctrl+F 查找、可打印、可收藏，适合开着边看边敲 |
 | 切换 / 刷新 | 换一个目录操作 / 重新读取状态 |
 | 跟随会话 | 手动切过目录后，一键回到当前会话的工作目录 |
 
@@ -94,7 +94,7 @@ GitHub插件/               # 本工作区根目录 = 插件包本体（link 安
 ├── package.json          # dsh.bundle.patch / dsh.client 声明
 ├── cordis.patch.yml      # bundle patch：把本插件插入 profile 配置树
 └── lib/
-    ├── index.js          # Host half：HTTP 路由 /git-panel/* + 13 个 git 模型工具
+    ├── index.js          # Host half：HTTP 路由 /git-panel/state|op|diag|help + 13 个 git 模型工具
     └── client.js         # Client half：shell.overlay 面板 + settings.general.item 开关
 ```
 

@@ -18,6 +18,8 @@ import {
   normalizeDir,
   parseBranchOutput,
   truncateText,
+  renderHelpHtml,
+  escapeHtml,
 } from '../lib/index.js'
 
 // ── parseBranchLine：porcelain `## ` 分支行 ────────────────────────────────
@@ -223,4 +225,38 @@ test('truncateText：超长按上限截断并保留截断提示', () => {
   assert.ok(result.includes('已截断'))
   assert.ok(result.length < text.length)
   assert.ok(result.length < 100)
+})
+
+// ── 帮助文档：escapeHtml / renderHelpHtml ────────────────────────────────
+
+test('escapeHtml：转义 HTML 敏感字符', () => {
+  assert.equal(escapeHtml('<a href="x">&\'</a>'), '&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;')
+})
+
+test('escapeHtml：null/undefined 当空串处理', () => {
+  assert.equal(escapeHtml(null), '')
+  assert.equal(escapeHtml(undefined), '')
+})
+
+test('renderHelpHtml：是完整文档且含全部分组与命令', () => {
+  const html = renderHelpHtml()
+  assert.ok(html.startsWith('<!doctype html>'))
+  assert.ok(html.includes('<title>Git 帮助 · dsh-git-panel</title>'))
+  assert.ok(html.includes('面板操作方式'))
+  for (const title of ['👀 查看状态与更新', '✍️ 提交与推送', '🌿 分支', '📦 救场 stash', '⌛ 撤销', '🏷️ 标签与历史', '🔌 远程仓库']) {
+    assert.ok(html.includes(title), title + ' 应出现在文档里')
+  }
+  // 命令既要显示成按钮，也要进 data-cmd（复制用的原文）
+  assert.ok(html.includes('>git status -sb</button>'))
+  assert.ok(html.includes('data-cmd="git status -sb"'))
+  // 复制脚本与深浅色适配
+  assert.ok(html.includes('navigator.clipboard'))
+  assert.ok(html.includes('prefers-color-scheme'))
+  assert.ok(html.trimEnd().endsWith('</html>'))
+})
+
+test('renderHelpHtml：命令里的引号被转义进属性，不会截断 HTML', () => {
+  const html = renderHelpHtml()
+  assert.ok(html.includes('data-cmd="git commit -m &quot;提交说明&quot;"'))
+  assert.ok(html.includes('data-cmd="git tag -a v1.0 -m &quot;版本说明&quot;"'))
 })
