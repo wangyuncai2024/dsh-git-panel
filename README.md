@@ -214,10 +214,10 @@ dsh-git-panel/            # 插件包本体（link 安装指向这里）
 ├── package.json          # dsh.bundle.patch / dsh.client 声明
 ├── cordis.patch.yml      # bundle patch：把本插件插入 profile 配置树
 ├── lib/
-│   ├── index.js          # Host half：HTTP 路由 /git-panel/state|op|net|diag|help + 13 个 git 模型工具
+│   ├── index.js          # Host half：HTTP 路由 /git-panel/state|op|net|diag|log|help + 13 个 git 模型工具
 │   └── client.js         # Client half：shell.overlay 面板 + settings.general.item 开关
 └── test/                 # node --test，不随包发布（package.json 的 files 里没有它）
-    ├── unit.test.mjs     # 宿主纯函数
+    ├── unit.test.mjs     # 宿主纯函数（含日志模块：级别过滤 / 轮转 / 尾读）
     ├── standalone.test.mjs # 零依赖加载 / 注册契约
     ├── client.test.mjs   # 客户端 bundle（假 window + 假 React）
     └── network.test.mjs  # 网络加速整条链路（含假 git 离线复现「镜像挂、直连通」）
@@ -232,6 +232,11 @@ dsh-git-panel/            # 插件包本体（link 安装指向这里）
 - **同源校验**：执行类 POST 请求校验 `Origin`，拒绝跨站提交。
 - **失败可见**：非零退出被归一化成 `{ code, stdout, stderr }` 回传面板，而不是抛异常，
   面板永远能渲染出原因。
+- **统一操作日志**：面板操作、AI 工具调用、网络配置变更、客户端注册过程、内部错误
+  全部写进 `$DSH_HOME/git-panel.log`（JSONL，级别 `off/error/warn/info/debug` 可配），
+  超过 `logMaxBytes` 自动轮转只留两份。命令参数经 `displayArgv` 打码后才落盘；写失败
+  只记 console 不抛异常 —— 日志是观测工具，不是新的故障点。`GET /git-panel/log` 可
+  直接读尾部。
 - **目录跟随会话**：面板通过 `shell.overlay` 的标准 props `useSessions` 读取当前会话
   的工作目录，切换会话时自动跟随；也可在面板里手动切换到任意目录。
 - **推送失败先补救再报错**：`POST /git-panel/op {op:"push"}` 的响应带
@@ -287,11 +292,14 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
 - id: git-panel
   config:
     defaultDir: /home/me/project   # 缺省操作目录；留空 = 跟随当前会话工作目录
+    logLevel: info                 # 日志级别：off | error | warn | info | debug
+    logMaxBytes: 2097152           # 日志轮转上限，超出后旧文件改名 .1
+    logFile: ''                    # 日志文件路径；留空 = $DSH_HOME/git-panel.log
 ```
 
 网络加速（镜像 / 代理）**不走这里**，而是 `$DSH_HOME/git-panel-net.json`，由面板的
 🌐 按钮读写 —— 那个设置要能随时改，不该逼用户编辑 yml 再重启。删掉该文件即恢复默认
-（不加速）。
+（不加速）。日志见[上一节](#日志维护排查用)。
 
 ## 安全边界（部署时注意）
 
@@ -311,6 +319,10 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
 - `POST` 保存配置**带同源校验**，因为该接口决定 git 命令**怎么执行** —— 被跨站
   改写就等于把仓库流量导向别处。这里的 `Origin` 校验和上面一样，是可伪造的，
   别把它当鉴权。
+
+`GET /git-panel/log` 是**只读**的日志尾读接口，无同源校验。日志本身已经是保守视角：
+命令参数打码、凭据不落盘；但它包含操作目录、仓库名与提交信息等**本机工作痕迹**，
+对局域网开放 web 端口时这些内容同样可见，请按下面的结论一并考虑。
 
 结论：**把 Git 面板和「对局域网开放 web 端口」分开考虑**；确实需要对局域网开放时，
 请用 DSH 的配对 / 鉴权层限制访问，或让 `webserver.host` 保持回环。
@@ -382,17 +394,44 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
    补 `-c`，而是让探测**复用同一个生成函数**（`probeJobs` 调 `networkExtraArgs`），
    把「能写错的地方」从两处减到零处。回归测试见 `test/network.test.mjs`。
 
-### 客户端诊断日志
+## 日志（维护排查用）
 
-界面注册类问题在浏览器控制台里对用户不可见，因此客户端会把注册过程回报到宿主：
+插件在 `$DSH_HOME` 下维护一份统一的操作日志：
 
 ```
-~/.dsh/git-panel-diag.log
+~/.dsh/git-panel.log       # JSONL：一行一条 { at, level, event, … }
+~/.dsh/git-panel.log.1     # 超过轮转上限后的旧文件（只保留这一份备份）
 ```
 
-内容包括 `apply:start`、`overlay:registered-direct`、`overlay:direct-failed`、
-`settings:register-failed-after-declaration` 这类阶段标记，排查「面板出现了但设置行
-没出现」时直接看这个文件即可。该文件可以随时删除。
+**记什么**：面板每一次操作（op：操作名、目录、命令、退出码、耗时、失败原因、是否补救/
+走哪条网络线路）、AI 工具每一次调用（tool）、网络加速配置变更（net）、客户端界面
+注册过程（diag）、插件生命周期与内部错误（lifecycle / error）。`debug` 级别还会记
+每一条 git 命令（含状态刷新那几条）——默认不落盘，排查深层问题时再开。
+
+**级别**（`logLevel`，默认 `info`）：
+
+| 级别 | 含义 | 默认 |
+| --- | --- | --- |
+| `off` | 完全不写 | |
+| `error` | 只记不该发生的事（注册失败、内部异常） | |
+| `warn` | + 操作/工具失败 | |
+| `info` | + 每次操作/配置变更的结果 | ✅ |
+| `debug` | + 每条 git 命令、每次状态刷新 | |
+
+**查看**：`GET /git-panel/log?lines=200` 返回最近 200 行原文（最多 2000）；
+也可以在浏览器里直接开这个地址。命令行查看：
+
+```bash
+tail -f ~/.dsh/git-panel.log          # 实时看
+tail -50 ~/.dsh/git-panel.log | jq    # 按字段解析（每行是一个 JSON 对象）
+```
+
+**安全**：日志里的命令参数与网络加速配置**一律打码**（代理凭据 → `***@`，与面板回显
+同规则）；文件只落在本机 `$DSH_HOME`，可随时删除。**写日志失败不影响任何功能**。
+
+**配置**：在 profile 的 `cordis.patch.yml` 里用同一个 id 覆盖
+`logLevel` / `logMaxBytes`（默认 2 MiB，超过后轮转）/ `logFile`（默认
+`$DSH_HOME/git-panel.log`）。
 
 ## 测试
 
@@ -401,7 +440,7 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
 clone 目标名、目录归一化），用 Node 自带测试框架覆盖：
 
 ```bash
-npm test        # node --test：122 个用例，毫秒级完成（需要 git / POSIX 的那几道会自行跳过）
+npm test        # node --test：131 个用例，毫秒级完成（需要 git / POSIX 的那几道会自行跳过）
 npm run check   # 语法检查（index.js + client.js）
 ```
 
@@ -410,9 +449,9 @@ npm run check   # 语法检查（index.js + client.js）
 | 文件 | 验证什么 |
 | --- | --- |
 | `test/standalone.test.mjs` | 用 mock ctx 把宿主半边跑一遍：`import` 不抛异常；`apply()` 在「服务就绪 / 稍后就绪 / 都缺 / ctx 被裁剪」四种情况下都不抛；卸载能清空路由与工具；13 个工具的 `parameters` 都落在 harness 支持的 JSON Schema 子集内（用了 `anyOf` / `$ref` / `format` 之类会让 `tools.register` 抛错、工具静默全丢） |
-| `test/unit.test.mjs` | 纯函数逐个断言：porcelain 分支行、`git remote -v`、推送/拉取的失败分类与中文提示、`git branch --remotes`（`origin/HEAD -> origin/main` 这类指针必须被排除）、远端引用校验（`-x` / `a..b` / 含空白的一律拒绝）、`HEAD...<ref>` 的领先/落后、远端默认分支的挑法（拿不准就返回 null，绝不猜）、`unrelatedChoices` 必须带上真正的远端分支名、clone 目标名、目录归一化 |
+| `test/unit.test.mjs` | 纯函数逐个断言：porcelain 分支行、`git remote -v`、推送/拉取的失败分类与中文提示、`git branch --remotes`（`origin/HEAD -> origin/main` 这类指针必须被排除）、远端引用校验（`-x` / `a..b` / 含空白的一律拒绝）、`HEAD...<ref>` 的领先/落后、远端默认分支的挑法（拿不准就返回 null，绝不猜）、`unrelatedChoices` 必须带上真正的远端分支名、clone 目标名、目录归一化；日志模块：级别归一化与过滤、JSONL 落盘、轮转只留 `.1` 一份、尾部读取 |
 | `test/client.test.mjs` | 用假 window + 假 React 把客户端 bundle 求值一遍：bundle 格式与 id 正确；**只 require `react` 这一个种子模块**（多 require 别的就说明依赖了构建产物）；导出 `apply` + `inject: ['slots']`；`slots` 缺失 / 直接注册成功 / 稍后声明三种时机都不抛；注册失败会把真实原因回报；组件在 props 缺失时也能渲染（slot 契约变化不白屏）；点改动看 diff 能走到终态（用**有状态**的假 React 真重渲染，不会停在「加载中…」）；**切换工作区后命令结果栏 / diff / 状态都属于新工作区**（旧仓库的瞬时结果被清掉，切走之后才回来的操作结果被丢弃）；网络加速设置块能展开、能保存、检测结果能列出，且网络失败时会自动展开；**「管理」里能看到远端分支**，点「拿成新分支」POST 的是带 `remote`/`branch` 的 `adoptRemote`（不是按当前分支名去猜），点远端分支不会触发 checkout |
-| `test/network.test.mjs` | 网络加速整条链路：配置归一化（含「只打开开关就该生效」这个踩过的坑）、`insteadOf` 的 base 拼法、push 不走镜像、`noMirror` 回退参数、凭据打码（GET 视图 / 命令回显 / 工具输出三处都不能漏）、失败分类（用户那条真实报错要认出来，404 不能被当成网络问题）、配置落盘与合并、`/git-panel/net` 三种方法 + 跨站拒绝 + 打码串回传语义；最后用**假 git 放到 PATH 最前面**离线复现「镜像挂、直连通」，验证自动回退确实发生、且结果栏会说明这件事 |
+| `test/network.test.mjs` | 网络加速整条链路：配置归一化（含「只打开开关就该生效」这个踩过的坑）、`insteadOf` 的 base 拼法、push 不走镜像、`noMirror` 回退参数、凭据打码（GET 视图 / 命令回显 / 工具输出三处都不能漏）、失败分类（用户那条真实报错要认出来，404 不能被当成网络问题）、配置落盘与合并、`/git-panel/net` 三种方法 + 跨站拒绝 + 打码串回传语义；最后用**假 git 放到 PATH 最前面**离线复现「镜像挂、直连通」，验证自动回退确实发生、且结果栏会说明这件事；`/git-panel/log` 路由返回最近日志行 |
 
 > 这几个文件是**换机器、换 DSH 版本时的第一道回归**：`npm test` 过了，说明插件
 > 自身的加载与注册契约没变；剩下的只是 DSH 侧服务是否提供（缺了就优雅降级）。

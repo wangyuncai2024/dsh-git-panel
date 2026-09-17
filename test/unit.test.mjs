@@ -5,9 +5,10 @@
 // 这些函数不触网、不落盘，跑一次毫秒级完成。
 // ============================================================================
 
-import test from 'node:test'
+import test, { after, before } from 'node:test'
 import assert from 'node:assert/strict'
-import { homedir } from 'node:os'
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   parseBranchLine,
@@ -28,6 +29,14 @@ import {
   truncateText,
   renderHelpHtml,
   escapeHtml,
+  // 日志模块
+  appendLog,
+  readLogTail,
+  logFilePath,
+  setLogConfig,
+  shouldLog,
+  normalizeLogLevel,
+  normalizeLogMaxBytes,
 } from '../lib/index.js'
 
 // ── parseBranchLine：porcelain `## ` 分支行 ────────────────────────────────
@@ -400,4 +409,118 @@ test('renderHelpHtml：命令里的引号被转义进属性，不会截断 HTML'
   const html = renderHelpHtml()
   assert.ok(html.includes('data-cmd="git commit -m &quot;提交说明&quot;"'))
   assert.ok(html.includes('data-cmd="git tag -a v1.0 -m &quot;版本说明&quot;"'))
+})
+
+// ── 日志模块（临时 DSH_HOME，不碰用户真实主目录） ──────────────────────────
+
+let logHome = null
+
+before(async () => {
+  logHome = await mkdtemp(join(tmpdir(), 'git-panel-log-'))
+  process.env.DSH_HOME = logHome
+})
+
+after(async () => {
+  setLogConfig({})
+  if (logHome !== null) await rm(logHome, { recursive: true, force: true })
+})
+
+test('日志：级别归一化 —— 非法/缺省落 info，off 是可用的合法值', () => {
+  assert.equal(normalizeLogLevel('off'), 'off')
+  assert.equal(normalizeLogLevel('error'), 'error')
+  assert.equal(normalizeLogLevel('warn'), 'warn')
+  assert.equal(normalizeLogLevel('info'), 'info')
+  assert.equal(normalizeLogLevel('debug'), 'debug')
+  assert.equal(normalizeLogLevel('INFO'), 'info')
+  assert.equal(normalizeLogLevel(''), 'info')
+  assert.equal(normalizeLogLevel(null), 'info')
+  assert.equal(normalizeLogLevel(42), 'info')
+})
+
+test('日志：轮转上限归一化 —— 非正数落默认值', () => {
+  assert.equal(normalizeLogMaxBytes(1024), 1024)
+  assert.equal(normalizeLogMaxBytes(0), 2 * 1024 * 1024)
+  assert.equal(normalizeLogMaxBytes(-5), 2 * 1024 * 1024)
+  assert.equal(normalizeLogMaxBytes(NaN), 2 * 1024 * 1024)
+  assert.equal(normalizeLogMaxBytes('x'), 2 * 1024 * 1024)
+})
+
+test('日志：shouldLog 按当前级别过滤', () => {
+  setLogConfig({ level: 'warn' })
+  assert.equal(shouldLog('error'), true)
+  assert.equal(shouldLog('warn'), true)
+  assert.equal(shouldLog('info'), false)
+  assert.equal(shouldLog('debug'), false)
+  setLogConfig({ level: 'off' })
+  assert.equal(shouldLog('error'), false)
+  setLogConfig({})
+})
+
+test('日志：appendLog 写 JSONL，字段齐全且可解析', async () => {
+  setLogConfig({ level: 'debug' })
+  const path = logFilePath()
+  assert.equal(path, join(logHome, 'git-panel.log'))
+  await rm(path, { force: true })
+  await appendLog('info', 'op', { op: 'push', dir: '/tmp/x', argv: ['push'], exit: 0, ms: 12 })
+  const text = await readFile(path, 'utf8')
+  const parsed = JSON.parse(text.trim())
+  assert.equal(parsed.level, 'info')
+  assert.equal(parsed.event, 'op')
+  assert.equal(parsed.op, 'push')
+  assert.equal(parsed.exit, 0)
+  assert.ok(typeof parsed.at === 'string' && parsed.at.length > 0, '要有时间戳')
+  setLogConfig({})
+})
+
+test('日志：级别过滤生效 —— info 级别下 debug 事件不落盘', async () => {
+  setLogConfig({ level: 'info' })
+  const path = logFilePath()
+  await rm(path, { force: true })
+  await appendLog('debug', 'git', { argv: ['status'] })
+  await appendLog('warn', 'op', { op: 'push', exit: 128 })
+  const text = await readFile(path, 'utf8')
+  assert.ok(!text.includes('"event":"git"'), 'debug 事件不该出现在 info 日志里')
+  assert.ok(text.includes('"event":"op"'), 'warn 事件应该落盘')
+  setLogConfig({})
+})
+
+test('日志：超过上限自动轮转，只保留当前与 .1 两份', async () => {
+  setLogConfig({ level: 'debug', maxBytes: 200 })
+  const path = logFilePath()
+  await rm(path, { force: true })
+  await rm(path + '.1', { force: true })
+  // 每条约 90 字节，上限 200：写 6 条必然触发至少一次轮转。
+  for (let index = 0; index < 6; index += 1) {
+    await appendLog('info', 'op', { op: 'push', exit: 0, payload: 'x'.repeat(40) })
+  }
+  const current = await stat(path)
+  assert.ok(current.size <= 200 + 200, '当前文件应被控制在轮转阈值附近（有一条是「跨过线」的那条）')
+  const backup = await stat(path + '.1')
+  assert.ok(backup.size > 0, '旧日志应被改名成 .1')
+  setLogConfig({})
+})
+
+test('日志：readLogTail 只读尾部指定行数', async () => {
+  setLogConfig({ level: 'debug' })
+  const path = logFilePath()
+  await rm(path, { force: true })
+  for (let index = 0; index < 10; index += 1) {
+    await appendLog('info', 'op', { op: 'push', n: index })
+  }
+  const tail = await readLogTail(3)
+  assert.equal(tail.length, 3)
+  assert.ok(tail[0].includes('"n":7'), '尾部第一行应是第 8 条')
+  assert.ok(tail[2].includes('"n":9'))
+  const all = await readLogTail(200)
+  assert.equal(all.length, 10, '行数上限内应全量返回')
+  const fallback = await readLogTail(0)
+  assert.equal(fallback.length, 10, '非正行数按默认值（取全部），但不该抛异常')
+  assert.equal((await readLogTail(-3)).length, 10)
+  setLogConfig({})
+})
+
+test('日志：readLogTail 文件不存在时返回空数组而不是抛异常', async () => {
+  setLogConfig({ file: join(logHome, 'does-not-exist.log') })
+  assert.deepEqual(await readLogTail(10), [])
+  setLogConfig({})
 })

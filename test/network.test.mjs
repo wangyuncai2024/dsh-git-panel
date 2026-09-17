@@ -680,3 +680,37 @@ test('network：[集成] 参数非法时的早期错误响应形状与成功分�
   assert.deepEqual(data.notes, [])
   assert.equal(data.accelerated, 'direct')
 })
+
+// ── 8. 路由集成：/git-panel/log（日志尾读） ─────────────────────────────────
+
+test('network：[路由] 注册了 log 路由，GET 返回最近日志行，重参数不炸', async () => {
+  const { apply } = await import('../lib/index.js')
+  const harness = makeCtx()
+  apply(harness.ctx, {})
+  const logRoute = harness.routes.find((route) => route.path === '/git-panel/log')
+  assert.ok(logRoute !== undefined, '应注册 /git-panel/log')
+
+  // 先造几条日志（写进临时 DSH_HOME 的 git-panel.log）。
+  const { appendLog, logFilePath } = await import('../lib/index.js')
+  const path = logFilePath()
+  assert.equal(path, join(home, 'git-panel.log'), '日志应落在 DSH_HOME 下')
+  await appendLog('info', 'op', { op: 'fake', exit: 0, n: 1 })
+  await appendLog('warn', 'op', { op: 'fake', exit: 128, n: 2 })
+
+  const out = makeResponse()
+  await logRoute.handler(makeRequest({ method: 'GET', url: '/git-panel/log?lines=10' }), out.response)
+  const data = out.json()
+  assert.equal(data.ok, true)
+  assert.ok(Array.isArray(data.lines) && data.lines.length >= 2, '应有日志行')
+  const last = JSON.parse(data.lines[data.lines.length - 1])
+  assert.equal(last.event, 'op')
+  assert.equal(last.n, 2, '尾部应是最新一条')
+
+  // 缺省与非法 lines 参数都不抛异常。
+  const plain = makeResponse()
+  await logRoute.handler(makeRequest({ method: 'GET', url: '/git-panel/log' }), plain.response)
+  assert.equal(plain.json().ok, true)
+  const bad = makeResponse()
+  await logRoute.handler(makeRequest({ method: 'GET', url: '/git-panel/log?lines=abc' }), bad.response)
+  assert.equal(bad.json().ok, true)
+})

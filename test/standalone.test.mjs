@@ -14,8 +14,21 @@
 //      mock 注册表在这里复刻 harness 的校验，跑测试就等价于跑一次真注册。
 // ============================================================================
 
-import test from 'node:test'
+import test, { after, before } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+// 日志会落在 $DSH_HOME 下；测试期间把它指到临时目录，绝不能写进用户真实主目录。
+let tempHome = null
+before(async () => {
+  tempHome = await mkdtemp(join(tmpdir(), 'git-panel-standalone-'))
+  process.env.DSH_HOME = tempHome
+})
+after(async () => {
+  if (tempHome !== null) await rm(tempHome, { recursive: true, force: true })
+})
 
 // ── harness JSON Schema 子集校验（复刻 dsh-tools 的 assertSupportedJsonSchema） ──
 // 只复刻判定规则，不引入任何依赖；规则见 packages/core/tools/src/json-schema.ts。
@@ -176,10 +189,10 @@ test('standalone：webServer / tools 就绪时，apply 直接注册成功', () =
   const harness = makeCtx()
   return import('../lib/index.js').then(({ apply }) => {
     assert.doesNotThrow(() => apply(harness.ctx, {}))
-    assert.equal(harness.routes.length, 5, '应注册 5 条路由（state/op/net/diag/help）')
+    assert.equal(harness.routes.length, 6, '应注册 6 条路由（state/op/net/diag/log/help）')
     assert.equal(harness.tools.length, 13, '应注册 13 个 git 工具')
     const paths = harness.routes.map((route) => route.path).sort()
-    assert.deepEqual(paths, ['/git-panel/diag', '/git-panel/help', '/git-panel/net', '/git-panel/op', '/git-panel/state'])
+    assert.deepEqual(paths, ['/git-panel/diag', '/git-panel/help', '/git-panel/log', '/git-panel/net', '/git-panel/op', '/git-panel/state'])
     for (const route of harness.routes) {
       assert.equal(route.kind, 'exact', `路由 ${route.path} 必须是 exact`)
       assert.equal(typeof route.handler, 'function', `路由 ${route.path} 必须有 handler`)
@@ -194,7 +207,7 @@ test('standalone：webServer / tools 稍后就绪时，apply 不抛异常且不�
   assert.equal(harness.routes.length, 0, '服务未就绪时不应有路由')
   assert.equal(harness.tools.length, 0, '服务未就绪时不应有工具')
   harness.flushInject()
-  assert.equal(harness.routes.length, 5, '服务就绪后应补上 5 条路由')
+  assert.equal(harness.routes.length, 6, '服务就绪后应补上 6 条路由')
   assert.equal(harness.tools.length, 13, '服务就绪后应补上 13 个工具')
 })
 
@@ -216,7 +229,7 @@ test('standalone：卸载会清空路由与工具（可重复 apply / dispose）
   const { apply } = await import('../lib/index.js')
   const harness = makeCtx()
   apply(harness.ctx, {})
-  assert.equal(harness.routes.length, 5)
+  assert.equal(harness.routes.length, 6)
   assert.equal(harness.tools.length, 13)
   harness.dispose()
   assert.equal(harness.routes.length, 0, '卸载后路由应被注销')

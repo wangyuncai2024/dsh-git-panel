@@ -15,7 +15,10 @@
 #   dsh plugin --profile web remove dsh-git-panel
 #
 # 可用行配置（在 profile 的 cordis.patch.yml 里用同一个 id 覆盖）：
-#   defaultDir: ''   # 面板默认操作的目录；留空 = 跟随当前会话工作目录
+#   defaultDir: ''          # 面板默认操作的目录；留空 = 跟随当前会话工作目录
+#   logLevel: 'info'        # 日志级别：off | error | warn | info | debug（默认 info）
+#   logMaxBytes: 2097152    # 日志轮转上限（超过后旧文件改名 .1，只留两份）
+#   logFile: ''             # 日志文件路径；留空 = $DSH_HOME/git-panel.log
 #
 # 注：网络加速（镜像 / 代理）不走这里，见 $DSH_HOME/git-panel-net.json —— 面板的 🌐
 # 按钮读写它；那个设置要能随时改，不该逼用户回来编辑本文件再重启。
