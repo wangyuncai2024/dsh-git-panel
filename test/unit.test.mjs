@@ -8,6 +8,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { homedir } from 'node:os'
+import { join } from 'node:path'
 import {
   parseBranchLine,
   parseRemotes,
@@ -17,6 +18,13 @@ import {
   cloneTargetName,
   normalizeDir,
   parseBranchOutput,
+  parseRemoteBranchOutput,
+  isSafeRemoteRef,
+  parseCompareOutput,
+  pickRemoteDefaultBranch,
+  buildOpArgv,
+  unrelatedChoices,
+  pullHint,
   truncateText,
   renderHelpHtml,
   escapeHtml,
@@ -178,7 +186,9 @@ test('normalizeDir：绝对路径原样返回', () => {
 
 test('normalizeDir：~ 与 ~/ 展开为主目录', () => {
   assert.equal(normalizeDir('~'), homedir())
-  assert.equal(normalizeDir('~/work/repo'), homedir() + '/work/repo')
+  // 期望值必须和实现用同一套拼接（path.join）：写成 homedir() + '/work/repo'
+  // 在 Windows 上必然失败 —— 那是测试自己的 bug，不是代码的。
+  assert.equal(normalizeDir('~/work/repo'), join(homedir(), 'work', 'repo'))
 })
 
 // ── parseBranchOutput：git branch --no-color（面板分支管理器） ─────────────
@@ -209,6 +219,137 @@ test('parseBranchOutput：还没有任何分支 → 空列表', () => {
   const parsed = parseBranchOutput('')
   assert.equal(parsed.current, null)
   assert.deepEqual(parsed.items, [])
+})
+
+// ── parseRemoteBranchOutput：git branch --remotes（面板「管理」的远端分组） ──
+
+test('parseRemoteBranchOutput：HEAD 指针不是分支，真分支按 ref 排序并标出默认分支', () => {
+  const parsed = parseRemoteBranchOutput(
+    '  origin/HEAD -> origin/main\n  upstream/dev\n  origin/main\n',
+  )
+  assert.equal(parsed.defaultRef, 'origin/main')
+  assert.deepEqual(parsed.items, [
+    { remote: 'origin', name: 'main', ref: 'origin/main', head: true },
+    { remote: 'upstream', name: 'dev', ref: 'upstream/dev', head: false },
+  ])
+})
+
+test('parseRemoteBranchOutput：只有 HEAD 指针（远端分支还没下载下来）→ 没有可点的分支', () => {
+  const parsed = parseRemoteBranchOutput('  origin/HEAD -> origin/main\n')
+  assert.equal(parsed.defaultRef, 'origin/main')
+  assert.deepEqual(parsed.items, [])
+})
+
+test('parseRemoteBranchOutput：空输出 / 非分支行都被忽略', () => {
+  assert.deepEqual(parseRemoteBranchOutput(''), { items: [], defaultRef: null })
+  assert.deepEqual(parseRemoteBranchOutput('  main\n  origin/\n'), { items: [], defaultRef: null })
+})
+
+// ── isSafeRemoteRef：远端引用会作为参数交给 git，必须先校验 ────────────────
+
+test('isSafeRemoteRef：正常远端引用通过', () => {
+  for (const ref of ['origin/main', 'origin/feature/x', 'upstream/v1.2.3', 'origin/main-2']) {
+    assert.equal(isSafeRemoteRef(ref), true, ref + ' 应该通过')
+  }
+})
+
+test('isSafeRemoteRef：选项、区间、空白与非法字符一个都不能放过', () => {
+  for (const ref of ['-x', '--upload-pack=y', 'a..b', 'HEAD~2', 'a b', 'a^', 'a:b', 'a?b', 'a*b',
+    '/x', 'x/', 'x.lock', 'a@{1}', '', null, undefined, 'x'.repeat(201)]) {
+    assert.equal(isSafeRemoteRef(ref), false, JSON.stringify(ref) + ' 必须被拒绝')
+  }
+})
+
+// ── parseCompareOutput：git rev-list --left-right --count ──────────────────
+
+test('parseCompareOutput：左列是本地领先、右列是本地落后', () => {
+  assert.deepEqual(parseCompareOutput('3\t5\n', 'origin/main'), { ref: 'origin/main', ahead: 3, behind: 5 })
+  assert.deepEqual(parseCompareOutput('0\t0', 'origin/main'), { ref: 'origin/main', ahead: 0, behind: 0 })
+})
+
+test('parseCompareOutput：解析不出来一律 0（宁可不说，也不报假数字）', () => {
+  assert.deepEqual(parseCompareOutput('', 'origin/main'), { ref: 'origin/main', ahead: 0, behind: 0 })
+  assert.deepEqual(parseCompareOutput('换个说法', 'origin/main'), { ref: 'origin/main', ahead: 0, behind: 0 })
+  assert.deepEqual(parseCompareOutput('7', 'origin/main'), { ref: 'origin/main', ahead: 7, behind: 0 })
+  assert.deepEqual(parseCompareOutput('-1\t-2', 'origin/main'), { ref: 'origin/main', ahead: 0, behind: 0 })
+})
+
+// ── pickRemoteDefaultBranch：本地分支名在远端不存在时，该按哪个分支重试 ────
+//
+// 这是「本地 master / 远端 main」那条路上的推断环节：推错了会去拉一个不存在的分支，
+// 所以只允许两种确定的答案 —— 远端自己的默认分支指针，或该远程唯一的分支。
+
+test('pickRemoteDefaultBranch：优先用远端自己的默认分支指针', () => {
+  const parsed = parseRemoteBranchOutput('  origin/HEAD -> origin/main\n  origin/main\n  origin/dev\n')
+  assert.equal(pickRemoteDefaultBranch(parsed, 'origin', 'master'), 'main')
+})
+
+test('pickRemoteDefaultBranch：没有指针但该远程只有一个分支时就是它', () => {
+  const parsed = parseRemoteBranchOutput('  origin/main\n')
+  assert.equal(pickRemoteDefaultBranch(parsed, 'origin', 'master'), 'main')
+})
+
+test('pickRemoteDefaultBranch：多个分支又没有指针 → 不猜（null）', () => {
+  const parsed = parseRemoteBranchOutput('  origin/dev\n  origin/release\n')
+  assert.equal(pickRemoteDefaultBranch(parsed, 'origin', 'master'), null)
+})
+
+test('pickRemoteDefaultBranch：同名、远程对不上、空列表一律 null', () => {
+  const parsed = parseRemoteBranchOutput('  origin/HEAD -> origin/main\n  origin/main\n')
+  assert.equal(pickRemoteDefaultBranch(parsed, 'origin', 'main'), null, '同名不是这个场景')
+  assert.equal(pickRemoteDefaultBranch(parsed, 'upstream', 'master'), null, '别的远程的分支不算')
+  assert.deepEqual(parseRemoteBranchOutput(''), { items: [], defaultRef: null })
+  assert.equal(pickRemoteDefaultBranch(parseRemoteBranchOutput(''), 'origin', 'master'), null)
+  assert.equal(pickRemoteDefaultBranch(null, 'origin', 'master'), null)
+})
+
+test('pickRemoteDefaultBranch：指针指向别的远程时不能拿来用', () => {
+  const parsed = parseRemoteBranchOutput('  upstream/HEAD -> upstream/main\n  upstream/main\n  origin/dev\n')
+  assert.equal(pickRemoteDefaultBranch(parsed, 'origin', 'master'), 'dev', 'origin 只有一个分支 → dev')
+  assert.equal(pickRemoteDefaultBranch(parsed, 'upstream', 'master'), 'main')
+})
+
+// ── buildOpArgv：新增的两种只读本地操作 ────────────────────────────────────
+
+test('buildOpArgv：remoteBranches 只列远端分支，不碰网络', async () => {
+  assert.deepEqual(await buildOpArgv('remoteBranches', {}), ['branch', '--remotes', '--no-color'])
+})
+
+test('buildOpArgv：compare 用 HEAD...<ref>，ref 非法时明确报错', async () => {
+  assert.deepEqual(
+    await buildOpArgv('compare', { ref: ' origin/main ' }),
+    ['rev-list', '--left-right', '--count', 'HEAD...origin/main'],
+  )
+  await assert.rejects(() => buildOpArgv('compare', { ref: '-x' }), /远端分支/)
+  await assert.rejects(() => buildOpArgv('compare', {}), /远端分支/)
+})
+
+// ── 「两套历史互不相关」的两个选择必须带着远端分支名 ──────────────────────
+//
+// 回归：按钮原先只回 { mode }，adoptRemote 于是按「当前分支名」去拼 remoteRef。
+// 而这两个按钮出现的典型场景恰恰是本地 master、远端 main —— 拼出来的
+// origin/master 根本不存在，点下去只会得到「本地还没有 origin/master」。
+
+test('unrelatedChoices：两个选择的参数里都带上真正的远端与分支', () => {
+  const choices = unrelatedChoices('origin', 'main')
+  assert.equal(choices.length, 2)
+  for (const choice of choices) {
+    assert.equal(choice.op, 'adoptRemote')
+    assert.equal(choice.params.remote, 'origin')
+    assert.equal(choice.params.branch, 'main')
+  }
+  assert.equal(choices[0].params.mode, 'branch')
+  assert.equal(choices[1].params.mode, 'reset')
+  // 文案要说清「动的是谁」：写错分支名比不写更糟。
+  assert.match(choices[0].detail, /origin\/main/)
+  assert.match(choices[1].confirm, /origin\/main/)
+})
+
+test('pullHint：remote-branch-missing 不能再只说「去推送」（那会推出多余的 master）', () => {
+  const hint = pullHint('remote-branch-missing')
+  assert.match(hint, /获取远程/, '要先让用户把远端分支信息拿下来')
+  assert.match(hint, /管理/, '要指向能看到远端分支的地方')
+  assert.doesNotMatch(hint, /^远端还没有这个分支：先点一次「推送」/)
 })
 
 // ── truncateText：超长输出截断（diff 面板防爆） ────────────────────────────

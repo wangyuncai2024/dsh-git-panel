@@ -187,6 +187,20 @@ function makeFakeWindow(options = {}) {
     ahead: 0, behind: 0, changes: [], log: [], remotes: [], notice: '不是仓库',
   }
   const opResponse = options.opResponse ?? stateResponse
+  /**
+   * 每个 op 可以给不同的响应（options.opResponses，按 op 名索引）；没配的 op 仍然
+   * 落在 opResponse 上 —— 老用例因此一行都不用改。
+   */
+  const opResponseFor = (init) => {
+    if (options.opResponses === undefined) return opResponse
+    try {
+      const parsed = JSON.parse(typeof init.body === 'string' ? init.body : '{}')
+      const found = options.opResponses[parsed.op]
+      return found !== undefined ? found : opResponse
+    } catch {
+      return opResponse
+    }
+  }
   // 网络加速配置：默认是「什么都没开」的干净状态。
   const netResponse = options.netResponse ?? {
     ok: true, mirrorEnabled: false, mirror: 'https://gh-proxy.com/',
@@ -210,7 +224,7 @@ function makeFakeWindow(options = {}) {
         : netResponse
       return { status: 200, json: async () => body }
     }
-    const body = String(url).includes('/git-panel/op') ? opResponse : stateResponse
+    const body = String(url).includes('/git-panel/op') ? opResponseFor(init) : stateResponse
     return { status: 200, json: async () => body }
   }
   return { win, registrations, storage, listeners, calls, fetchStub, netResponse }
@@ -859,3 +873,84 @@ test('client standalone：开了加速时，命令结果栏要说明这条命令
   assert.ok(bars.includes('已通过镜像 gh-proxy.com'), `结果栏应说明走了镜像，实际：${JSON.stringify(outputBars(after))}`)
   assert.ok(bars.includes('$ git fetch --all --prune'), '命令回显仍要在')
 })
+
+// ── 7. 远端分支：获取远程之后要能看见，并且能一键拿成本地新分支 ─────────────
+//
+// 现场：本地 `git init` 出来的分支叫 master，远端默认分支叫 main。面板原先只列本地
+// 分支，界面上根本看不到 origin/main —— 用户既不知道远端有什么，也没有入口去点它，
+// 于是「拉取」只会在 couldn't find remote ref master 上打转。
+
+test('client standalone：分支管理器列出远端分支，点「拿成新分支」把显式的 origin/main 交给宿主', async () => {
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'master', upstream: null,
+    ahead: 0, behind: 0, changes: [], log: [],
+    remotes: [{ name: 'origin', url: 'https://example.com/demo.git' }],
+  }
+  const harness = makeFakeWindow({
+    stateResponse: repoState,
+    opResponses: {
+      branches: {
+        ok: true, branches: { current: 'master', items: [{ name: 'master', current: true }] },
+        state: repoState,
+      },
+      remoteBranches: {
+        ok: true,
+        remoteBranches: {
+          defaultRef: 'origin/main',
+          items: [
+            { remote: 'origin', name: 'main', ref: 'origin/main', head: true },
+            { remote: 'origin', name: 'dev', ref: 'origin/dev', head: false },
+          ],
+        },
+        state: repoState,
+      },
+      adoptRemote: { ok: true, state: repoState },
+      compare: { ok: true, compare: { ref: 'origin/main', ahead: 0, behind: 3 }, state: repoState },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  const initial = await react.settle()
+
+  const manage = findButton(initial, '管理')
+  assert.ok(manage !== undefined, '应渲染出「管理」按钮')
+  await manage.props.onClick()
+  const opened = await react.settle()
+
+  const opCalls = () => harness.calls.fetch
+    .filter((call) => String(call.url).includes('/git-panel/op'))
+    .map((call) => JSON.parse(call.init.body))
+  // 展开管理器要同时问本地和远端两份 —— 远端那份是这一块界面的数据来源。
+  assert.ok(opCalls().some((payload) => payload.op === 'remoteBranches'), '展开时应查一次远端分支')
+  const texts = flattenTree(opened).map(textOf)
+  assert.ok(
+    texts.some((text) => text.includes('origin/main')),
+    `远端分支要出现在管理器里，实际：${JSON.stringify(texts.slice(0, 30))}`,
+  )
+  assert.ok(texts.some((text) => text.includes('origin/dev')), '远端不止一个分支时都要列出来')
+
+  // 「拿成新分支」：必须显式带 remote/branch —— 当前分支叫 master，猜不出来。
+  const take = findButton(opened, '拿成新分支')
+  assert.ok(take !== undefined, '远端分支旁边要有「拿成新分支」')
+  await assert.doesNotReject(() => take.props.onClick(), '点「拿成新分支」不能以异常结束')
+  const afterTake = await react.settle()
+  const asked = opCalls().filter((payload) => payload.op === 'adoptRemote')
+  assert.equal(asked.length, 1, '应该 POST 过一次 adoptRemote：' + JSON.stringify(opCalls()))
+  assert.deepEqual(
+    { mode: asked[0].mode, remote: asked[0].remote, branch: asked[0].branch },
+    { mode: 'branch', remote: 'origin', branch: 'main' },
+  )
+  // 点远端分支**不是**切换分支：不能顺手发出 checkout（那会变成游离 HEAD）。
+  assert.ok(!opCalls().some((payload) => payload.op === 'checkout'), '点远端分支不该触发 checkout')
+
+  // 「比较」：把 ref 交给宿主，原始两列数字由宿主翻成人话放进 notes。
+  const compare = findButton(afterTake, '比较')
+  assert.ok(compare !== undefined, '远端分支旁边要有「比较」')
+  await assert.doesNotReject(() => compare.props.onClick(), '点「比较」不能以异常结束')
+  await react.settle()
+  const compares = opCalls().filter((payload) => payload.op === 'compare')
+  assert.equal(compares.length, 1, '应该 POST 过一次 compare')
+  assert.equal(compares[0].ref, 'origin/main')
+})
+
