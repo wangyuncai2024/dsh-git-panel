@@ -15,6 +15,9 @@
 //      ReferenceError 结束，宿主侧 git 明明执行成功了，调用方却永远拿不到返回值。
 //   7. 切换工作区后，面板上的东西（命令结果栏 / diff / 分支列表 / 状态）都属于
 //      新工作区：属于旧仓库的瞬时结果会被清掉，切走之后才回来的异步结果会被丢弃。
+//   8. 「跟随会话工作目录」真的会跟随：假 store 用的是**真实形状**的 SessionListState
+//      （当前会话 = `retainedBy.mainView > 0` 的那一行，没有 `state.current` 这个字段）。
+//      回归的是：面板曾读一个不存在的字段，于是永远按宿主进程的 cwd 跑。
 // ============================================================================
 
 import test from 'node:test'
@@ -411,7 +414,7 @@ test('client standalone：GitPanel 在 props 缺失时也能渲染（slot 契约
   const panel = registered.find((entry) => entry.options.name === 'shell.overlay').component
   assert.doesNotThrow(() => renderComponent(harness, react, panel, undefined))
   assert.doesNotThrow(() => renderComponent(harness, react, panel, {}))
-  assert.doesNotThrow(() => renderComponent(harness, react, panel, { useSessions: (selector) => selector({ current: 's1', byId: { s1: { cwd: '/tmp/demo' } } }) }))
+  assert.doesNotThrow(() => renderComponent(harness, react, panel, { useSessions: (selector) => selector(sessionStore({ s1: { cwd: '/tmp/demo' } })) }))
 })
 
 test('client standalone：GitPanelToggle 能渲染且读得到开关状态', () => {
@@ -476,7 +479,7 @@ test('client standalone：点改动看 diff 不会停在「加载中…」（run
   const panel = registered.find((entry) => entry.options.name === 'shell.overlay').component
 
   react.mount(panel, {
-    useSessions: (selector) => selector({ current: 's1', byId: { s1: { cwd: '/tmp/demo' } } }),
+    useSessions: (selector) => selector(sessionStore({ s1: { cwd: '/tmp/demo' } })),
   })
   const initial = await react.settle()
 
@@ -518,7 +521,7 @@ test('client standalone：runOp 失败时调用方拿到 ok:false（而不是 un
   exports.apply({ slots })
   const panel = registered.find((entry) => entry.options.name === 'shell.overlay').component
   react.mount(panel, {
-    useSessions: (selector) => selector({ current: 's1', byId: { s1: { cwd: '/tmp/demo' } } }),
+    useSessions: (selector) => selector(sessionStore({ s1: { cwd: '/tmp/demo' } })),
   })
   const initial = await react.settle()
   const clickable = flattenTree(initial).find((node) =>
@@ -558,6 +561,42 @@ function makeDirAwareFetch(harness, byDir) {
   }
 }
 
+/**
+ * 造一份**真实形状**的 SessionListState（宿主的 `@deepseek-ai/dsh-api-session-controller`
+ * 契约）：字段是 ids / byId / phase / subagentsByParent / jobsBySession。
+ *
+ * 关键：「当前会话」**不是** `state.current` —— 那个字段不存在。宿主自己的
+ * publishMain 与 ui-workspace 都是认列表里 `retainedBy.mainView > 0` 的那一行，
+ * 这里刻意不提供 `current`：谁再照着不存在的字段写，测试立刻红。
+ *
+ * 缺省把第一行当作「主视图持有的会话」，要造别的形态（例如没有当前会话）就显式传
+ * `retainedBy`。
+ */
+function sessionStore(rows) {
+  const ids = Object.keys(rows)
+  const byId = {}
+  ids.forEach((id, index) => {
+    byId[id] = {
+      id,
+      displayTitle: id,
+      running: false,
+      blank: false,
+      updatedAt: 0,
+      retainedBy: index === 0 ? { mainView: 1 } : {},
+      ...rows[id],
+    }
+  })
+  return { ids, byId, phase: 'ready', subagentsByParent: {}, jobsBySession: {} }
+}
+
+/** 把「当前会话」换成另一行 —— 等价于用户在会话列表里点了另一个会话。 */
+function selectSession(store, id) {
+  for (const row of Object.values(store.byId)) {
+    row.retainedBy = { mainView: row.id === id ? 1 : 0 }
+  }
+  return store
+}
+
 /** 在给定会话 store 上挂载面板组件（`store` 可变，用来模拟切换工作区）。 */
 function mountPanel(exports, react, store) {
   const { slots, registered } = makeSlots()
@@ -595,7 +634,7 @@ test('client standalone：切换工作区后命令结果栏不再挂着上一个
   harness.fetchStub = makeDirAwareFetch(harness, { '/tmp/ws-a': WS_A, '/tmp/ws-b': WS_B })
   const react = makeStatefulReact()
   const { exports } = evaluateBundle(harness, react.api)
-  const store = { current: 's1', byId: { s1: { cwd: '/tmp/ws-a' } } }
+  const store = sessionStore({ s1: { cwd: '/tmp/ws-a' } })
   mountPanel(exports, react, store)
 
   const first = await react.settle()
@@ -622,6 +661,96 @@ test('client standalone：切换工作区后命令结果栏不再挂着上一个
   )
 })
 
+test('client standalone：切到另一个会话后，面板跟着换到那个会话的工作目录', async () => {
+  const harness = makeFakeWindow({ stateResponse: WS_A })
+  harness.fetchStub = makeDirAwareFetch(harness, { '/tmp/ws-a': WS_A, '/tmp/ws-b': WS_B })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  // 两个会话、两个工作目录：这才是「跟着会话切换工作目录」的真实形态
+  // （旧测试只动同一个会话的 cwd，恰好绕过了「认哪一行是当前会话」这一步）。
+  const store = sessionStore({ 's-a': { cwd: '/tmp/ws-a' }, 's-b': { cwd: '/tmp/ws-b' } })
+  mountPanel(exports, react, store)
+
+  const first = await react.settle()
+  assert.ok(textOf(first).includes('/tmp/ws-a'), '前置条件：面板先跟着会话 A 的工作目录')
+  assert.ok(textOf(first).includes('main'), '前置条件：显示的是 A 的分支')
+
+  selectSession(store, 's-b')
+  const after = await react.settle()
+
+  assert.ok(textOf(after).includes('/tmp/ws-b'), `切会话后面板要落到新会话的工作目录，实际：${textOf(after).slice(0, 300)}`)
+  assert.ok(textOf(after).includes('dev'), '分支要变成 B 的分支')
+  assert.ok(!textOf(after).includes('/tmp/ws-a'), '面板不能再显示旧会话的工作目录')
+})
+
+test('client standalone：没有当前会话时退回宿主缺省目录，而不是瞎猜一行', async () => {
+  const harness = makeFakeWindow({ stateResponse: WS_A })
+  const requested = []
+  const base = harness.fetchStub
+  harness.fetchStub = async (url, init) => {
+    if (String(url).includes('/git-panel/state')) requested.push(String(url))
+    return base(url, init)
+  }
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  // 两行都没有 mainView：一份「还没选中任何会话」的列表。
+  const store = sessionStore({
+    's-a': { cwd: '/tmp/ws-a', retainedBy: {} },
+    's-b': { cwd: '/tmp/ws-b', retainedBy: {} },
+  })
+  mountPanel(exports, react, store)
+  await react.settle()
+
+  assert.ok(requested.length > 0, '面板还是要读一次状态（用宿主缺省目录）')
+  assert.ok(
+    requested.every((url) => !url.includes('dir=')),
+    `没有当前会话时不能挑一行当当前会话，实际请求：${JSON.stringify(requested)}`,
+  )
+})
+
+test('client standalone：手动切过目录后不再被会话目录覆盖（跟随会话按钮才恢复）', async () => {
+  // 手填的目录必须由「宿主回传的 state.dir」确认（面板以宿主归一化后的路径为准），
+  // 所以这一份响应的 dir 就是 /tmp/manual。
+  const wsManual = { ...WS_B, dir: '/tmp/manual' }
+  const harness = makeFakeWindow({ stateResponse: WS_A })
+  harness.fetchStub = makeDirAwareFetch(harness, {
+    '/tmp/ws-a': WS_A, '/tmp/ws-b': WS_B, '/tmp/manual': wsManual,
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  const store = sessionStore({ 's-a': { cwd: '/tmp/ws-a' }, 's-b': { cwd: '/tmp/ws-b' } })
+  mountPanel(exports, react, store)
+
+  const first = await react.settle()
+  const switchButton = findButton(first, '切换')
+  assert.ok(switchButton !== undefined, '目录行应有「切换」按钮')
+  switchButton.props.onClick()
+
+  const editing = await react.settle()
+  const input = flattenTree(editing).find((node) => node.type === 'input')
+  assert.ok(input !== undefined, '点「切换」后应出现目录输入框')
+  input.props.onChange({ target: { value: '/tmp/manual' } })
+
+  const typed = await react.settle()
+  const confirm = findButton(typed, '确定')
+  assert.ok(confirm !== undefined, '输入框旁应有「确定」')
+  await confirm.props.onClick()
+  const manual = await react.settle()
+  assert.ok(textOf(manual).includes('/tmp/manual'), '手动切换后应停在自己填的目录')
+
+  // 会话切走了：手动选过目录就不再跟随（这是有意的，避免覆盖用户的输入）。
+  selectSession(store, 's-b')
+  const stillManual = await react.settle()
+  assert.ok(textOf(stillManual).includes('/tmp/manual'), '手动选过目录后不应被会话目录覆盖')
+
+  // 点「跟随会话」才回到当前会话的工作目录。
+  const follow = findButton(stillManual, '跟随会话')
+  assert.ok(follow !== undefined, '手动切换后应出现「跟随会话」按钮')
+  await follow.props.onClick()
+  const followed = await react.settle()
+  assert.ok(textOf(followed).includes('/tmp/ws-b'), `点「跟随会话」后应回到会话 B 的目录，实际：${textOf(followed).slice(0, 300)}`)
+})
+
 test('client standalone：切走之后才回来的操作结果不能盖到新工作区上', async () => {
   const opResult = {
     ok: true, command: 'git pull', exitCode: 0, stdout: 'Already up to date.', stderr: '',
@@ -640,7 +769,7 @@ test('client standalone：切走之后才回来的操作结果不能盖到新工
   }
   const react = makeStatefulReact()
   const { exports } = evaluateBundle(harness, react.api)
-  const store = { current: 's1', byId: { s1: { cwd: '/tmp/ws-a' } } }
+  const store = sessionStore({ s1: { cwd: '/tmp/ws-a' } })
   mountPanel(exports, react, store)
 
   const first = await react.settle()
@@ -687,7 +816,7 @@ test('client standalone：点 🌐 能展开加速设置，且渲染不抛异常
   const harness = makeFakeWindow()
   const react = makeStatefulReact()
   const { exports } = evaluateBundle(harness, react.api)
-  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
 
   const tree = await openNet(react)
   const text = textOf(tree)
@@ -709,7 +838,7 @@ test('client standalone：面板挂载时会读一次宿主配置', async () => 
   })
   const react = makeStatefulReact()
   const { exports } = evaluateBundle(harness, react.api)
-  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
   const tree = await react.settle()
 
   assert.ok(
@@ -730,7 +859,7 @@ test('client standalone：保存代理会把输入框内容 POST 给 /git-panel/
   const harness = makeFakeWindow()
   const react = makeStatefulReact()
   const { exports } = evaluateBundle(harness, react.api)
-  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
   const tree = await openNet(react)
 
   const input = flattenTree(tree).find((node) => node.type === 'input' && String(node.props.placeholder).includes('本机代理'))
@@ -770,7 +899,7 @@ test('client standalone：宿主是旧版本、还没有 /git-panel/net 时，�
   }
   const react = makeStatefulReact()
   const { exports } = evaluateBundle(harness, react.api)
-  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
 
   const tree = await react.settle()
   assert.ok(textOf(tree).includes('main'), '读不到加速配置不影响仓库状态显示')
@@ -792,7 +921,7 @@ test('client standalone：点「检测网络」把各线路结果列出来（含
   })
   const react = makeStatefulReact()
   const { exports } = evaluateBundle(harness, react.api)
-  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
   const tree = await openNet(react)
 
   await findButton(tree, '检测网络').props.onClick()
@@ -824,7 +953,7 @@ test('client standalone：宿主判定是网络问题时自动展开加速设置
   })
   const react = makeStatefulReact()
   const { exports } = evaluateBundle(harness, react.api)
-  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
 
   const initial = await react.settle()
   // 先确认设置块确实是收起的（不然下面那条断言会因为「本来就开着」而假通过）。
@@ -862,7 +991,7 @@ test('client standalone：开了加速时，命令结果栏要说明这条命令
   })
   const react = makeStatefulReact()
   const { exports } = evaluateBundle(harness, react.api)
-  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
   const initial = await react.settle()
 
   await findButton(initial, '获取远程').props.onClick()
@@ -910,7 +1039,7 @@ test('client standalone：分支管理器列出远端分支，点「拿成新分
   })
   const react = makeStatefulReact()
   const { exports } = evaluateBundle(harness, react.api)
-  mountPanel(exports, react, { current: 's1', byId: { s1: { cwd: '/tmp/demo' } } })
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
   const initial = await react.settle()
 
   const manage = findButton(initial, '管理')

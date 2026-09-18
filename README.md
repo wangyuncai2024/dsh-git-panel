@@ -239,6 +239,11 @@ dsh-git-panel/            # 插件包本体（link 安装指向这里）
   直接读尾部。
 - **目录跟随会话**：面板通过 `shell.overlay` 的标准 props `useSessions` 读取当前会话
   的工作目录，切换会话时自动跟随；也可在面板里手动切换到任意目录。
+  注意「当前会话」的判据：`shell.overlay` 是 **root scope** 插槽，拿不到 `sessionId`，
+  而 `useSessions` 的 state（`SessionListState`）里只有 `ids / byId / phase /
+  subagentsByParent / jobsBySession` —— **没有 `current` 字段**。所以面板认的是列表里
+  `retainedBy.mainView > 0` 的那一行，与宿主自己的 `publishMain`、`ui-workspace` 的
+  `mainSessionId` 同一判据（见开发注记第 6 条）。
 - **推送失败先补救再报错**：`POST /git-panel/op {op:"push"}` 的响应带
   `reason`（`no-remote` / `no-upstream` / `remote-not-found` / `auth-failed` /
   `rejected`）与 `hint`（中文下一步提示），面板据此自动展开地址输入框或提示先拉取。
@@ -327,7 +332,7 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
 结论：**把 Git 面板和「对局域网开放 web 端口」分开考虑**；确实需要对局域网开放时，
 请用 DSH 的配对 / 鉴权层限制访问，或让 `webserver.host` 保持回环。
 
-## 开发注记（五个真踩过的坑）
+## 开发注记（六个真踩过的坑）
 
 写这类界面插件时，下面这些坑都会让功能**静默失败或半成功、且不报任何错**，值得记下来：
 
@@ -394,6 +399,27 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
    补 `-c`，而是让探测**复用同一个生成函数**（`probeJobs` 调 `networkExtraArgs`），
    把「能写错的地方」从两处减到零处。回归测试见 `test/network.test.mjs`。
 
+6. **假 store 抄了不存在的字段，功能全废测试还是绿的。**
+   「目录跟随会话」一直没生效，根因是面板读 `useSessions((state) => state.current)` ——
+   而 `SessionListState` 上**根本没有 `current` 这个字段**（只有 `ids / byId / phase /
+   subagentsByParent / jobsBySession`）。于是 `sessionCwd` 恒为 `undefined`，面板从不给
+   宿主发 `dir`，宿主只能退回自己的缺省目录（`process.cwd()`，实测是
+   `~/.dsh/profiles/web`，根本不是仓库）——「切了会话，面板还停在上一个仓库 / 显示不是
+   仓库」，而**界面上不会有任何报错**。
+   为什么测试没拦住：当时的假 store 写成了 `{ current: 's1', byId: { s1: { cwd } } }`，
+   和真代码**抄了同一个错误假设**，选择器当然拿得到值。这类「mock 与真实契约不一致」
+   是测试里最贵的假绿：它验证的是「我们俩想的一样」，不是「宿主真的是这样」。
+   修法与教训：
+
+   - 判据用宿主自己的：`shell.overlay` 是 root scope，没有 `sessionId`，当前会话要从
+     列表里认 `retainedBy.mainView > 0` 的那一行（宿主 `publishMain` 与
+     `ui-workspace.mainSessionId` 都是这个判据）。
+   - 测试里的 store 必须**照真实契约造**：现在有 `sessionStore()` 这个 helper，
+     它刻意**不提供 `current`** —— 谁再照着不存在的字段写，测试立刻红。另外补了三道
+     回归：切到**另一个会话**（另一行）要跟着换目录；没有当前会话时退回宿主缺省目录、
+     不瞎猜一行；手动切过目录后不被会话目录覆盖，「跟随会话」按钮才恢复。
+     见 `test/client.test.mjs` 第 5 节。
+
 ## 日志（维护排查用）
 
 插件在 `$DSH_HOME` 下维护一份统一的操作日志：
@@ -440,7 +466,7 @@ tail -50 ~/.dsh/git-panel.log | jq    # 按字段解析（每行是一个 JSON �
 clone 目标名、目录归一化），用 Node 自带测试框架覆盖：
 
 ```bash
-npm test        # node --test：131 个用例，毫秒级完成（需要 git / POSIX 的那几道会自行跳过）
+npm test        # node --test：134 个用例，毫秒级完成（需要 git / POSIX 的那几道会自行跳过）
 npm run check   # 语法检查（index.js + client.js）
 ```
 
@@ -450,7 +476,7 @@ npm run check   # 语法检查（index.js + client.js）
 | --- | --- |
 | `test/standalone.test.mjs` | 用 mock ctx 把宿主半边跑一遍：`import` 不抛异常；`apply()` 在「服务就绪 / 稍后就绪 / 都缺 / ctx 被裁剪」四种情况下都不抛；卸载能清空路由与工具；13 个工具的 `parameters` 都落在 harness 支持的 JSON Schema 子集内（用了 `anyOf` / `$ref` / `format` 之类会让 `tools.register` 抛错、工具静默全丢） |
 | `test/unit.test.mjs` | 纯函数逐个断言：porcelain 分支行、`git remote -v`、推送/拉取的失败分类与中文提示、`git branch --remotes`（`origin/HEAD -> origin/main` 这类指针必须被排除）、远端引用校验（`-x` / `a..b` / 含空白的一律拒绝）、`HEAD...<ref>` 的领先/落后、远端默认分支的挑法（拿不准就返回 null，绝不猜）、`unrelatedChoices` 必须带上真正的远端分支名、clone 目标名、目录归一化；日志模块：级别归一化与过滤、JSONL 落盘、轮转只留 `.1` 一份、尾部读取 |
-| `test/client.test.mjs` | 用假 window + 假 React 把客户端 bundle 求值一遍：bundle 格式与 id 正确；**只 require `react` 这一个种子模块**（多 require 别的就说明依赖了构建产物）；导出 `apply` + `inject: ['slots']`；`slots` 缺失 / 直接注册成功 / 稍后声明三种时机都不抛；注册失败会把真实原因回报；组件在 props 缺失时也能渲染（slot 契约变化不白屏）；点改动看 diff 能走到终态（用**有状态**的假 React 真重渲染，不会停在「加载中…」）；**切换工作区后命令结果栏 / diff / 状态都属于新工作区**（旧仓库的瞬时结果被清掉，切走之后才回来的操作结果被丢弃）；网络加速设置块能展开、能保存、检测结果能列出，且网络失败时会自动展开；**「管理」里能看到远端分支**，点「拿成新分支」POST 的是带 `remote`/`branch` 的 `adoptRemote`（不是按当前分支名去猜），点远端分支不会触发 checkout |
+| `test/client.test.mjs` | 用假 window + 假 React 把客户端 bundle 求值一遍：bundle 格式与 id 正确；**只 require `react` 这一个种子模块**（多 require 别的就说明依赖了构建产物）；导出 `apply` + `inject: ['slots']`；`slots` 缺失 / 直接注册成功 / 稍后声明三种时机都不抛；注册失败会把真实原因回报；组件在 props 缺失时也能渲染（slot 契约变化不白屏）；点改动看 diff 能走到终态（用**有状态**的假 React 真重渲染，不会停在「加载中…」）；**切换工作区后命令结果栏 / diff / 状态都属于新工作区**（旧仓库的瞬时结果被清掉，切走之后才回来的操作结果被丢弃）；**「目录跟随会话」用的是真实形状的 `SessionListState`**（当前会话 = `retainedBy.mainView > 0` 的那一行，假 store 刻意没有 `current` 字段）：切到另一个会话要跟着换目录、没有当前会话时退回宿主缺省目录、手动切过目录后不被覆盖；网络加速设置块能展开、能保存、检测结果能列出，且网络失败时会自动展开；**「管理」里能看到远端分支**，点「拿成新分支」POST 的是带 `remote`/`branch` 的 `adoptRemote`（不是按当前分支名去猜），点远端分支不会触发 checkout |
 | `test/network.test.mjs` | 网络加速整条链路：配置归一化（含「只打开开关就该生效」这个踩过的坑）、`insteadOf` 的 base 拼法、push 不走镜像、`noMirror` 回退参数、凭据打码（GET 视图 / 命令回显 / 工具输出三处都不能漏）、失败分类（用户那条真实报错要认出来，404 不能被当成网络问题）、配置落盘与合并、`/git-panel/net` 三种方法 + 跨站拒绝 + 打码串回传语义；最后用**假 git 放到 PATH 最前面**离线复现「镜像挂、直连通」，验证自动回退确实发生、且结果栏会说明这件事；`/git-panel/log` 路由返回最近日志行 |
 
 > 这几个文件是**换机器、换 DSH 版本时的第一道回归**：`npm test` 过了，说明插件
