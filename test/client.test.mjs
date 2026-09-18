@@ -537,6 +537,67 @@ test('client standalone：runOp 失败时调用方拿到 ok:false（而不是 un
   )
 })
 
+// ── 4b. 回归：展开的 diff 必须内联在改动清单里 ──────────────────────────────
+//
+// 现场：点改动条目后，diff 原先渲染在清单**外面**，而面板正文是一个可滚动的 flex 列
+// —— 展开后 diff 既把清单挤成一条缝（`overflow:auto` 的 flex 子项自动最小尺寸为 0，
+// 默认的 flex-shrink:1 会压缩它），又常常落到可视区之外。用户看到的现象就是
+// 「弹出来的改动信息框把改动文件展示框盖住了」。
+//
+// 修法：diff 内联在被点的那一行下面，与文件行共用清单这一个滚动区；清单本身
+// flex:0 0 auto（自带滚动，永不被压），展开期间把清单取景框放高。
+
+test('client standalone：展开的 diff 内联在改动清单里，不挤掉也不盖住清单', async () => {
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: 'origin/main',
+    ahead: 0, behind: 0,
+    changes: [
+      { code: ' M', path: 'a.txt', staged: false },
+      { code: ' M', path: 'b.txt', staged: false },
+    ],
+    log: [], remotes: [],
+  }
+  const harness = makeFakeWindow({
+    stateResponse: repoState,
+    opResponse: {
+      ok: true, diff: 'diff --git a/a.txt b/a.txt\n@@ -1 +1,2 @@\n one\n+two\n', state: repoState,
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+
+  const initial = await react.settle()
+  const list = flattenTree(initial).find((node) => node.props.key === 'changes')
+  assert.ok(list !== undefined, '应渲染出改动清单容器')
+  // 这一条钉的是根因：清单自带滚动，绝不能被 flex 压缩（否则就是「被盖住」）。
+  assert.equal(list.props.style.flex, '0 0 auto', '改动清单不能被 flex 压扁')
+  assert.equal(list.props.style.maxHeight, '148px', '没展开 diff 时清单保持紧凑高度')
+
+  const clickable = flattenTree(initial).find((node) =>
+    typeof node.props.title === 'string' && node.props.title.includes('点击查看 diff'))
+  assert.ok(clickable !== undefined, '改动清单里应出现可点击的条目')
+  await clickable.props.onClick()
+  const opened = await react.settle()
+
+  const openedList = flattenTree(opened).find((node) => node.props.key === 'changes')
+  assert.ok(openedList !== undefined, '展开后清单容器仍在')
+  const inline = flattenTree(openedList).find((node) =>
+    node.type === 'pre' && textOf(node).includes('+two'))
+  assert.ok(
+    inline !== undefined,
+    '展开的 diff 必须是改动清单的子树：放在清单外面会被正文滚动挤走，表现就是「盖住了清单」',
+  )
+  assert.equal(openedList.props.style.maxHeight, '360px', '展开 diff 时清单取景框要放高，否则 diff 只露一两行')
+  assert.ok(textOf(openedList).includes('b.txt'), '展开一个文件的 diff 不能顶掉其它文件行')
+
+  // 展开中的那一行要有标记，用户才知道下面那块 diff 是谁的。
+  const active = flattenTree(openedList).find((node) =>
+    typeof node.props.className === 'string' && node.props.className.includes('dgp-rowitem-active'))
+  assert.ok(active !== undefined, '展开中的那一行要高亮')
+  assert.ok(textOf(active).includes('a.txt'), '高亮的应该是被点开的那个文件')
+})
+
 // ── 5. 回归：切换工作区后，面板上的东西必须跟着切 ───────────────────────────
 //
 // 曾出现的问题：换工作区（切会话 / 手动切目录）后只有 snapshot 被替换，命令结果栏
