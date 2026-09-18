@@ -37,6 +37,10 @@ function makeFakeReact() {
   return {
     api: {
       createElement: (type, props, ...children) => {
+        // 函数组件就地展开（复刻 reconciler 唯一必需的那一步）。面板被拆成多个
+        // 展示组件之后，测试仍然拿到一棵扁平的宿主元素树 —— 不需要真的实现 reconciler，
+        // 但**必须**有这一步，否则组件的内容在树里根本不存在。
+        if (typeof type === 'function') return type(Object.assign({}, props, { children: children }))
         const node = { type, props: props === null || props === undefined ? {} : props, children }
         nodes.push(node)
         return node
@@ -45,6 +49,10 @@ function makeFakeReact() {
         const index = hookIndex++
         return [typeof initial === 'function' ? initial() : initial, (value) => { effects.push([index, value]) }]
       },
+      useReducer: (reducer, initial) => [
+        typeof initial === 'function' ? initial() : initial,
+        (action) => { effects.push(['reducer', action]) },
+      ],
       useRef: (initial) => ({ current: initial }),
       useEffect: (callback) => { effects.push(['effect', callback]) },
       useCallback: (callback) => callback,
@@ -76,11 +84,15 @@ function makeStatefulReact() {
   const pendingEffects = []
 
   const api = {
-    createElement: (type, elementProps, ...children) => ({
-      type,
-      props: elementProps === null || elementProps === undefined ? {} : elementProps,
-      children,
-    }),
+    createElement: (type, elementProps, ...children) => {
+      // 与 makeFakeReact 同一套展开规则：函数组件就地调用，返回它画出的宿主元素。
+      if (typeof type === 'function') return type(Object.assign({}, elementProps, { children: children }))
+      return {
+        type,
+        props: elementProps === null || elementProps === undefined ? {} : elementProps,
+        children,
+      }
+    },
     useState: (initial) => {
       const index = cursor++
       if (!Object.hasOwn(hooks, index)) hooks[index] = typeof initial === 'function' ? initial() : initial
@@ -91,6 +103,19 @@ function makeStatefulReact() {
         dirty = true
       }
       return [hooks[index], set]
+    },
+    // 面板的状态全部收在一个 reducer 里（见 lib/client.js 的 panelReducer）：
+    // 假 React 必须真的存值、真的跑 reducer，才能验「切工作区把旧仓库的字段清掉」。
+    useReducer: (reducer, initial) => {
+      const index = cursor++
+      if (!Object.hasOwn(hooks, index)) hooks[index] = typeof initial === 'function' ? initial() : initial
+      const dispatch = (action) => {
+        const next = reducer(hooks[index], action)
+        if (Object.is(next, hooks[index])) return
+        hooks[index] = next
+        dirty = true
+      }
+      return [hooks[index], dispatch]
     },
     useRef: (initial) => {
       const index = cursor++
@@ -1079,12 +1104,12 @@ test('client standalone：分支管理器列出远端分支，点「拿成新分
   const harness = makeFakeWindow({
     stateResponse: repoState,
     opResponses: {
+      // 合并后的契约：一次 branches 同时回本地与远端两份。宿主因此只花一次 HTTP
+      // 往返，而且数据型操作不回读仓库状态（noState）—— 展开一次管理器由原先的
+      // 两次 op ×（1 条 git + 4 条状态 git）降到 2 条 git。
       branches: {
-        ok: true, branches: { current: 'master', items: [{ name: 'master', current: true }] },
-        state: repoState,
-      },
-      remoteBranches: {
         ok: true,
+        branches: { current: 'master', items: [{ name: 'master', current: true }] },
         remoteBranches: {
           defaultRef: 'origin/main',
           items: [
@@ -1092,7 +1117,7 @@ test('client standalone：分支管理器列出远端分支，点「拿成新分
             { remote: 'origin', name: 'dev', ref: 'origin/dev', head: false },
           ],
         },
-        state: repoState,
+        state: null,
       },
       adoptRemote: { ok: true, state: repoState },
       compare: { ok: true, compare: { ref: 'origin/main', ahead: 0, behind: 3 }, state: repoState },
@@ -1111,8 +1136,15 @@ test('client standalone：分支管理器列出远端分支，点「拿成新分
   const opCalls = () => harness.calls.fetch
     .filter((call) => String(call.url).includes('/git-panel/op'))
     .map((call) => JSON.parse(call.init.body))
-  // 展开管理器要同时问本地和远端两份 —— 远端那份是这一块界面的数据来源。
-  assert.ok(opCalls().some((payload) => payload.op === 'remoteBranches'), '展开时应查一次远端分支')
+  // 展开管理器只发**一次** branches（本地 + 远端一次拿回），且带 noState：
+  // 数据型操作没必要让宿主再回读一次仓库状态（那要额外跑 4 条 git）。
+  const branchCalls = opCalls().filter((payload) => payload.op === 'branches')
+  assert.equal(branchCalls.length, 1, '展开时应恰好查一次 branches：' + JSON.stringify(opCalls()))
+  assert.equal(branchCalls[0].noState, true, '数据型操作应带 noState')
+  assert.ok(
+    !opCalls().some((payload) => payload.op === 'remoteBranches'),
+    '远端分支已随 branches 一起回来，不该再发第二次 op',
+  )
   const texts = flattenTree(opened).map(textOf)
   assert.ok(
     texts.some((text) => text.includes('origin/main')),
@@ -1142,5 +1174,240 @@ test('client standalone：分支管理器列出远端分支，点「拿成新分
   const compares = opCalls().filter((payload) => payload.op === 'compare')
   assert.equal(compares.length, 1, '应该 POST 过一次 compare')
   assert.equal(compares[0].ref, 'origin/main')
+})
+
+// ── 8. 新增契约：宿主诊断必须可见 / 截断必须说出来 / noState / reset-repo ─────
+
+test('client standalone：宿主给的 notice 必须显示出来（回归：宿主算了却没人读）', async () => {
+  // 没装 git 时宿主会把「请先安装 git」放进 state.notice。面板原先只显示一句通用的
+  // 「还不是 Git 仓库」—— 最有用的那条诊断在传输层就丢了。
+  const harness = makeFakeWindow({
+    stateResponse: {
+      ok: true, dir: '/tmp/demo', isRepo: false, branch: null, upstream: null,
+      ahead: 0, behind: 0, changes: [], changesTotal: 0, log: [], remotes: [],
+      notice: '未检测到 git：请先安装 git（https://git-scm.com）后重试。',
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+  const text = textOf(tree)
+  assert.ok(text.includes('未检测到 git'), `面板要显示宿主的诊断，实际：${text.slice(0, 300)}`)
+  assert.ok(text.includes('还没有 Git 仓库'), '通用说明仍要在（它告诉用户下一步点哪里）')
+})
+
+test('client standalone：宿主只说「还不是仓库」时不重复叠加，通用说明就够了', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: {
+      ok: true, dir: '/tmp/demo', isRepo: false, branch: null, upstream: null,
+      ahead: 0, behind: 0, changes: [], changesTotal: 0, log: [], remotes: [],
+      notice: '当前目录还不是 Git 仓库',
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+  const text = textOf(tree)
+  assert.ok(text.includes('还没有 Git 仓库'))
+  assert.equal(text.includes('⚠'), false, '默认 notice 与通用说明重复，不该再叠一行')
+})
+
+test('client standalone：改动被截断时必须说明「还有 N 处未显示」，胶囊用真实总数', async () => {
+  const changes = []
+  for (let index = 0; index < 100; index += 1) {
+    changes.push({ code: ' M', path: 'f' + index + '.txt', staged: false })
+  }
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: null,
+    ahead: 0, behind: 0, changes, changesTotal: 137, log: [], remotes: [],
+  }
+  const harness = makeFakeWindow({ stateResponse: repoState })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+  const text = textOf(tree)
+  // 面板画 40 条，宿主回了 100 条、真实总数 137：差多少必须写出来。
+  assert.ok(text.includes('还有 97 处未显示'), `截断要说出来，实际：${text.slice(0, 400)}`)
+  assert.ok(text.includes('137 处改动'), '摘要胶囊要用宿主的真实总数，不是列表长度')
+})
+
+test('client standalone：数据型操作带 noState，state:null 也不会抹掉面板状态', async () => {
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: 'origin/main',
+    ahead: 0, behind: 0,
+    changes: [{ code: ' M', path: 'a.txt', staged: false }],
+    changesTotal: 1, log: [], remotes: [],
+  }
+  const harness = makeFakeWindow({
+    stateResponse: repoState,
+    opResponses: {
+      // 宿主对 noState 的回复：state 为 null（省掉 4 条 git 进程）。
+      diff: { ok: true, diff: 'diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-one\n+two\n', state: null },
+      branches: {
+        ok: true,
+        branches: { current: 'main', items: [{ name: 'main', current: true }] },
+        remoteBranches: { defaultRef: null, items: [] },
+        state: null,
+      },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+
+  const clickable = flattenTree(initial).find((node) =>
+    typeof node.props.title === 'string' && node.props.title.includes('点击查看 diff'))
+  await clickable.props.onClick()
+  const after = await react.settle()
+
+  const opCalls = () => harness.calls.fetch
+    .filter((call) => String(call.url).includes('/git-panel/op'))
+    .map((call) => JSON.parse(call.init.body))
+  const diffCall = opCalls().find((payload) => payload.op === 'diff')
+  assert.equal(diffCall.noState, true, 'diff 是数据型操作，应带 noState')
+  assert.ok(textOf(after).includes('+two'), 'diff 仍然要显示出来')
+  // state:null 绝不能把面板状态清空：分支、目录、改动清单都还在。
+  assert.ok(textOf(after).includes('main'), 'state:null 不该抹掉分支')
+  assert.ok(textOf(after).includes('/tmp/demo'), 'state:null 不该抹掉目录')
+  assert.ok(textOf(after).includes('a.txt'), 'state:null 不该抹掉改动清单')
+})
+
+test('client standalone：数组子节点必须都带 key（真实 React 会警告，假 React 不会）', async () => {
+  // 回归：GitPanel 的 children 是数组，拆分组件之后有几个元素忘了 key —— 假 React
+  // 不检查这一点，真实 React 18 会打 "Each child in a list should have a unique key"。
+  // 这里把规则显式编码进测试：数组里的每个元素都必须有 props.key。
+  const problems = []
+  const walk = (node, path) => {
+    if (node === null || node === undefined || typeof node !== 'object') return
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child, path + '[]')
+      return
+    }
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        if (Array.isArray(child)) {
+          for (const item of child) {
+            if (item !== null && typeof item === 'object' && !Array.isArray(item) && item.props.key === undefined) {
+              problems.push(String(item.type) + ' @' + path)
+            }
+          }
+        }
+        walk(child, path + '>' + String(node.type))
+      }
+    }
+  }
+  const assertKeys = (tree) => {
+    walk(tree, 'root')
+    assert.deepEqual(problems, [], '数组里的元素必须带 key：' + JSON.stringify(problems))
+  }
+
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: 'origin/main',
+    ahead: 0, behind: 0,
+    changes: [{ code: ' M', path: 'a.txt', staged: false }],
+    changesTotal: 1,
+    log: [{ hash: 'abc1234', subject: 'first' }],
+    remotes: [{ name: 'origin', url: 'https://example.com/a.git' }],
+  }
+  // ① 仓库 + 展开网络块与分支管理器
+  const harness = makeFakeWindow({
+    stateResponse: repoState,
+    opResponses: {
+      branches: {
+        ok: true,
+        branches: { current: 'main', items: [{ name: 'main', current: true }] },
+        remoteBranches: { defaultRef: 'origin/main', items: [{ remote: 'origin', name: 'main', ref: 'origin/main', head: true }] },
+        state: null,
+      },
+      pull: {
+        ok: false, reason: 'unrelated', message: '两边是两套互不相关的历史',
+        choices: [{ id: 'branch', label: '拿成新分支', detail: '安全', op: 'adoptRemote', params: {}, confirm: null }],
+        network: false, notes: [], accelerated: 'direct', state: repoState,
+      },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  let tree = await react.settle()
+  assertKeys(tree)
+  await findButton(tree, '🌐').props.onClick()
+  tree = await react.settle()
+  assertKeys(tree)
+  await findButton(tree, '管理').props.onClick()
+  tree = await react.settle()
+  assertKeys(tree)
+  await findButton(tree, '拉取').props.onClick()
+  tree = await react.settle()
+  assert.ok(findButton(tree, '拿成新分支') !== undefined, '前置条件：选项按钮渲染出来了')
+  assertKeys(tree)
+
+  // ② 非仓库 + 展开克隆表单
+  const emptyHarness = makeFakeWindow({
+    stateResponse: {
+      ok: true, dir: '/tmp/demo', isRepo: false, branch: null, upstream: null,
+      ahead: 0, behind: 0, changes: [], changesTotal: 0, log: [], remotes: [], notice: null,
+    },
+  })
+  const emptyReact = makeStatefulReact()
+  const emptyBundle = evaluateBundle(emptyHarness, emptyReact.api)
+  mountPanel(emptyBundle.exports, emptyReact, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  let emptyTree = await emptyReact.settle()
+  assertKeys(emptyTree)
+  await findButton(emptyTree, '克隆仓库').props.onClick()
+  emptyTree = await emptyReact.settle()
+  assert.ok(findButton(emptyTree, '开始克隆') !== undefined, '前置条件：克隆表单渲染出来了')
+  assertKeys(emptyTree)
+})
+
+test('client standalone：换工作区会收起分支管理器并清掉远程地址草稿（reducer 的 reset-repo）', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: WS_A,
+    opResponses: {
+      branches: {
+        ok: true,
+        branches: { current: 'main', items: [{ name: 'main', current: true }] },
+        remoteBranches: { defaultRef: null, items: [] },
+        state: null,
+      },
+    },
+  })
+  harness.fetchStub = makeDirAwareFetch(harness, { '/tmp/ws-a': WS_A, '/tmp/ws-b': WS_B })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  const store = sessionStore({ s1: { cwd: '/tmp/ws-a' } })
+  mountPanel(exports, react, store)
+
+  let tree = await react.settle()
+  await findButton(tree, '管理').props.onClick()
+  tree = await react.settle()
+  assert.ok(textOf(tree).includes('本地分支'), '前置条件：分支管理器已展开')
+
+  // A 没有远程 → 按钮是「配置」；展开后填一个**没保存**的地址。
+  await findButton(tree, '配置').props.onClick()
+  tree = await react.settle()
+  // 输入框的「内容」在 props.value 里（textOf 只看子节点，DOM 里的 input 也一样）。
+  const remoteInput = (node) => flattenTree(node).find((child) =>
+    child.type === 'input' && String(child.props.placeholder).includes('git@github.com'))
+  const before = remoteInput(tree)
+  assert.ok(before !== undefined, '应出现仓库地址输入框')
+  before.props.onChange({ target: { value: 'https://example.com/not-saved.git' } })
+  tree = await react.settle()
+  assert.ok(String(remoteInput(tree).props.value).includes('not-saved'), '前置条件：草稿已填进输入框')
+
+  // 换工作区：属于旧仓库的东西必须清掉 —— 这正是 reducer 的 'reset-repo' 在管的事。
+  store.byId.s1.cwd = '/tmp/ws-b'
+  tree = await react.settle()
+  assert.equal(textOf(tree).includes('本地分支'), false, '分支管理器属于旧仓库，切走后要收起')
+  const after = remoteInput(tree)
+  assert.equal(
+    after !== undefined && String(after.props.value).includes('not-saved'),
+    false,
+    '远程地址草稿不能带到新仓库',
+  )
 })
 
