@@ -752,6 +752,24 @@ test('network：[路由] 注册了 log 路由，GET 返回最近日志行，重�
   const plain = makeResponse()
   await logRoute.handler(makeRequest({ method: 'GET', url: '/git-panel/log' }), plain.response)
   assert.equal(plain.json().ok, true)
+
+  // 只读的日志同样不接受「带来源的跨站读取」；不带 Origin（地址栏直开 / curl）照常。
+  const cross = makeResponse()
+  await logRoute.handler(makeRequest({
+    method: 'GET',
+    url: '/git-panel/log',
+    headers: { origin: 'http://evil.example', host: '127.0.0.1:3080' },
+  }), cross.response)
+  assert.equal(cross.state.status, 403, '跨站读取日志应被拒绝')
+  assert.equal(cross.json().ok, false)
+
+  const same = makeResponse()
+  await logRoute.handler(makeRequest({
+    method: 'GET',
+    url: '/git-panel/log',
+    headers: SAME_ORIGIN,
+  }), same.response)
+  assert.equal(same.json().ok, true, '同源读取日志不受影响')
   const bad = makeResponse()
   await logRoute.handler(makeRequest({ method: 'GET', url: '/git-panel/log?lines=abc' }), bad.response)
   assert.equal(bad.json().ok, true)
