@@ -510,3 +510,195 @@ test('standalone：enhanceRemoteBranches 在本地有 origin/HEAD 时不发任�
     await rm(root, { recursive: true, force: true })
   }
 })
+
+// ── 7. 「安全拉取」：有未提交改动时也能拉取，且改动永远不丢 ────────────────
+//
+// 现场：工作区有未提交改动（尤其是未跟踪文件）时，裸 `git pull` 会被 git 拒绝
+// （Your local changes would be overwritten）。stashPull 把这条路做成自动三步：
+// git stash push -u → git pull（走与「拉取」按钮相同的加速/补救通道）→ 拉取成功后
+// git stash pop；拉取失败则自动 pop 把改动还给用户。下面的用例在真 git 的临时
+// 仓库里从头到尾跑一遍，重点断言「改动一件不少」（这也是它唯一不能退化的属性）。
+//
+// pullRunner 模拟 routes.js 传进来的执行通道：executeWithAcceleration 的返回形状
+// （{ argv, args, result, accel, notes }），但直连、无加速参数 —— 本地裸仓库
+// 不需要也没有镜像/代理。
+
+/** 造一个「裸远端 + 已克隆工作区」的现场；onOrigin 用来推进远端。 */
+async function stashPullFixture(context, onOrigin) {
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const run = promisify(execFile)
+  const root = await mkdtemp(join(tmpdir(), 'git-panel-stashpull-'))
+  try {
+    await run('git', ['init', '--bare', '-b', 'main'], { cwd: root })
+  } catch {
+    await rm(root, { recursive: true, force: true })
+    context.skip('本机没有可用的 git')
+    return null
+  }
+  const bare = join(root, 'origin.git')
+  const src = join(root, 'src')
+  const work = join(root, 'work')
+  await mkdir(src, { recursive: true })
+  try {
+    await run('git', ['init', '-q', '-b', 'main'], { cwd: src })
+    await run('git', ['-C', src, 'config', 'user.email', 't@t'])
+    await run('git', ['-C', src, 'config', 'user.name', 't'])
+    await writeFile(join(src, 'f.txt'), '本地第一版\n')
+    await run('git', ['-C', src, 'add', 'f.txt'])
+    await run('git', ['-C', src, 'commit', '-qm', 'A'])
+    await run('git', ['clone', '-q', '--bare', src, bare])
+    await run('git', ['clone', '-q', bare, work])
+    await run('git', ['-C', work, 'config', 'user.email', 't@t'])
+    await run('git', ['-C', work, 'config', 'user.name', 't'])
+    if (onOrigin !== undefined && onOrigin !== null) {
+      await onOrigin(src, bare)
+    }
+    return { run, root, src, bare, work }
+  } catch (error) {
+    await rm(root, { recursive: true, force: true })
+    throw error
+  }
+}
+
+/** 直连执行器（形状与 executeWithAcceleration 的返回一致，无加速参数）。 */
+function plainPullRunner(work) {
+  return async (argv, timeoutMs) => {
+    const { runGit } = await import('../lib/index.js')
+    const result = await runGit(argv, work, { timeoutMs: timeoutMs })
+    return { argv: argv.slice(), args: [], result, accel: { mode: 'direct' }, notes: [] }
+  }
+}
+
+test('standalone：stashPull —— 有改动（含未跟踪）时藏起→拉取→恢复，一件不少', async (context) => {
+  const { stashPull, runGit } = await import('../lib/index.js')
+  const fixture = await stashPullFixture(context, async (src, bare) => {
+    const { execFile } = await import('node:child_process')
+    const { promisify } = await import('node:util')
+    const run = promisify(execFile)
+    // 远端推进一个提交 B：加一个新文件 g.txt（不动 f.txt —— 本地改动都在 f.txt 上，
+    // 两边的改动互不重叠，stash pop 才能干净弹回；重叠场景由「弹回冲突」那条用例覆盖）。
+    await writeFile(join(src, 'g.txt'), '远端新文件\n')
+    await run('git', ['-C', src, 'add', 'g.txt'])
+    await run('git', ['-C', src, 'commit', '-qm', 'B'])
+    await run('git', ['-C', src, 'push', '-q', bare, 'main'])
+  })
+  if (fixture === null) return
+  const { run, root, work } = fixture
+  try {
+    // 工作区制造两处改动：已跟踪文件的修改 + 一个未跟踪文件。
+    await writeFile(join(work, 'f.txt'), '本地第一版\n我的本地改动\n')
+    await writeFile(join(work, 'u.txt'), '还没加入版本库\n')
+    const before = await runGit(['rev-parse', 'HEAD'], work, { timeoutMs: 20000 })
+
+    const payload = await stashPull({}, work, plainPullRunner(work))
+
+    assert.equal(payload.ok, true, '改动保留拉取应该成功：' + JSON.stringify(payload))
+    const after = await runGit(['rev-parse', 'HEAD'], work, { timeoutMs: 20000 })
+    assert.notEqual(after.stdout.trim(), before.stdout.trim(), 'HEAD 应该推进到远端新提交')
+    assert.equal(await readFile(join(work, 'f.txt'), 'utf8'), '本地第一版\n我的本地改动\n',
+      '已跟踪文件的改动要原样恢复')
+    assert.equal(await readFile(join(work, 'u.txt'), 'utf8'), '还没加入版本库\n', '未跟踪文件要原样恢复')
+    assert.equal(await readFile(join(work, 'g.txt'), 'utf8'), '远端新文件\n', '远端新提交的文件要拉下来')
+    const stash = await runGit(['stash', 'list'], work, { timeoutMs: 20000 })
+    assert.equal(stash.stdout.trim(), '', '成功后 stash 应该清空（改动已经弹回，不留备份）')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('standalone：stashPull —— 拉取失败时自动把改动还回工作区，stash 不留底', async (context) => {
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const run = promisify(execFile)
+  const { stashPull, runGit } = await import('../lib/index.js')
+  const root = await mkdtemp(join(tmpdir(), 'git-panel-stashpull-fail-'))
+  const work = join(root, 'work')
+  await mkdir(work, { recursive: true })
+  try {
+    await run('git', ['init', '-q', '-b', 'main'], { cwd: work })
+    await run('git', ['-C', work, 'config', 'user.email', 't@t'])
+    await run('git', ['-C', work, 'config', 'user.name', 't'])
+    await writeFile(join(work, 'f.txt'), 'x\n')
+    await run('git', ['-C', work, 'add', 'f.txt'])
+    await run('git', ['-C', work, 'commit', '-qm', 'A'])
+    // 有改动，但仓库一个远程都没有 → pull 必然失败（no-remote）。
+    await writeFile(join(work, 'f.txt'), '我的改动\n')
+    await writeFile(join(work, 'u.txt'), '未跟踪\n')
+
+    const payload = await stashPull({}, work, plainPullRunner(work))
+
+    assert.equal(payload.ok, false, '没有远程时拉取必然失败')
+    assert.equal(payload.reason, 'no-remote')
+    assert.equal(await readFile(join(work, 'f.txt'), 'utf8'), '我的改动\n', '拉取失败后改动要弹回工作区')
+    assert.equal(await readFile(join(work, 'u.txt'), 'utf8'), '未跟踪\n', '未跟踪文件也要弹回')
+    const stash = await runGit(['stash', 'list'], work, { timeoutMs: 20000 })
+    assert.equal(stash.stdout.trim(), '', '失败回滚后 stash 应该清空')
+    assert.ok(
+      payload.notes.some((note) => note.includes('还给了工作区')),
+      '失败回滚要明说改动已经还给用户：' + JSON.stringify(payload.notes),
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('standalone：stashPull —— 工作区干净时只拉取，不多此一举制造 stash', async (context) => {
+  const { stashPull, runGit } = await import('../lib/index.js')
+  const fixture = await stashPullFixture(context, async (src, bare) => {
+    const { execFile } = await import('node:child_process')
+    const { promisify } = await import('node:util')
+    const run = promisify(execFile)
+    await writeFile(join(src, 'g.txt'), '新文件\n')
+    await run('git', ['-C', src, 'add', 'g.txt'])
+    await run('git', ['-C', src, 'commit', '-qm', 'B'])
+    await run('git', ['-C', src, 'push', '-q', bare, 'main'])
+  })
+  if (fixture === null) return
+  const { root, work } = fixture
+  try {
+    const payload = await stashPull({}, work, plainPullRunner(work))
+    assert.equal(payload.ok, true, '干净工作区的安全拉取应该直接成功：' + JSON.stringify(payload))
+    const has = await runGit(['cat-file', '-e', 'HEAD:g.txt'], work, { timeoutMs: 20000 })
+    assert.equal(has.code, 0, '远端新提交 g.txt 应该被拉下来')
+    const stash = await runGit(['stash', 'list'], work, { timeoutMs: 20000 })
+    assert.equal(stash.stdout.trim(), '', '干净工作区不应该产生 stash')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('standalone：stashPull —— 弹回改动时冲突：拉取完成、stash 备份保留、提示收尾', async (context) => {
+  const { stashPull, runGit } = await import('../lib/index.js')
+  const fixture = await stashPullFixture(context, async (src, bare) => {
+    const { execFile } = await import('node:child_process')
+    const { promisify } = await import('node:util')
+    const run = promisify(execFile)
+    // 远端把 f.txt 的第一行改成「远端版」。
+    await writeFile(join(src, 'f.txt'), '远端版\n')
+    await run('git', ['-C', src, 'add', 'f.txt'])
+    await run('git', ['-C', src, 'commit', '-qm', 'B'])
+    await run('git', ['-C', src, 'push', '-q', bare, 'main'])
+  })
+  if (fixture === null) return
+  const { root, work } = fixture
+  try {
+    // 本地把同一行的第一行改成「本地版」→ 与远端改动撞同一行。
+    await writeFile(join(work, 'f.txt'), '本地版\n')
+    const payload = await stashPull({}, work, plainPullRunner(work))
+
+    assert.equal(payload.ok, false, '弹回冲突需要用户处理，不能算成功')
+    assert.equal(payload.reason, 'stash-pop-conflict')
+    const saved = await readFile(join(work, 'f.txt'), 'utf8')
+    assert.ok(saved.includes('<<<<<<<') && saved.includes('本地版') && saved.includes('远端版'),
+      '冲突现场应该在文件里（两边的改动都在）：' + saved)
+    const stash = await runGit(['stash', 'list'], work, { timeoutMs: 20000 })
+    assert.equal(stash.stdout.trim().length > 0, true, '弹回冲突时 stash 备份必须保留（改动不能丢）')
+    assert.ok(
+      payload.notes.some((note) => note.includes('没有丢')),
+      '冲突提示要明说改动没有丢：' + JSON.stringify(payload.notes),
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

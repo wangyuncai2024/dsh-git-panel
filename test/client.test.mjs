@@ -1089,6 +1089,46 @@ test('client standalone：开了加速时，命令结果栏要说明这条命令
   assert.ok(bars.includes('$ git fetch --all --prune'), '命令回显仍要在')
 })
 
+test('client standalone：「安全拉取」按钮存在，点击把 stashPull 交给宿主并展示过程结果', async () => {
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: null,
+    ahead: 0, behind: 0, changes: [{ code: ' M', path: 'f.txt', staged: false }],
+    changesTotal: 1, log: [], remotes: [],
+  }
+  const harness = makeFakeWindow({
+    stateResponse: repoState,
+    opResponses: {
+      stashPull: {
+        ok: true, command: 'git pull', exitCode: 0, stdout: 'Updating a1b2..c3d4', stderr: '',
+        message: null, hint: null, network: false, accelerated: 'direct',
+        notes: [
+          '已把你的改动（含未跟踪文件）藏进 stash（git stash push -u）：拉取成功会原样恢复，失败也会自动还给你',
+          '拉取成功，你的改动已原样还原（git stash pop）',
+        ],
+        state: repoState,
+      },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+
+  const btn = findButton(initial, '安全拉取')
+  assert.ok(btn !== undefined, '仓库里应有「安全拉取」按钮')
+  assert.equal(typeof btn.props.title, 'string', '按钮要带悬停说明（说明它做什么、改动不会丢）')
+
+  await btn.props.onClick()
+  const after = await react.settle()
+  const posted = harness.calls.fetch.find((call) => String(call.url).includes('/git-panel/op'))
+  assert.ok(posted !== undefined, '应发出 op 请求')
+  assert.equal(JSON.parse(posted.init.body).op, 'stashPull', '请求的 op 名应是 stashPull')
+  const bars = outputBars(after).join('\n')
+  assert.ok(bars.includes('$ git pull'), '命令回显要在结果栏')
+  assert.ok(bars.includes('藏进 stash'), '过程说明（先藏起来）要显示')
+  assert.ok(bars.includes('已原样还原'), '结果说明（改动还原）要显示')
+})
+
 // ── 7. 远端分支：获取远程之后要能看见，并且能一键拿成本地新分支 ─────────────
 //
 // 现场：本地 `git init` 出来的分支叫 master，远端默认分支叫 main。面板原先只列本地
