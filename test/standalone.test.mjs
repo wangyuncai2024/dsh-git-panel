@@ -16,7 +16,7 @@
 
 import test, { after, before } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -298,14 +298,19 @@ test('standalone：面板与工具对切换/新建分支生成同一份 argv', a
 })
 
 test('standalone：OPS 的 network 标记与 net.js 的 NETWORK_OPS 完全一致', async () => {
-  const { OPS, NETWORK_OPS } = await import('../lib/index.js')
+  const { OPS, NETWORK_OPS, AUX_NET_OPS } = await import('../lib/index.js')
   // 两个集合按不同的键索引（面板操作名 vs git 子命令），必须由断言钉住，否则
   // 「加了新操作却忘了让加速生效」会变成静默的直连。
   for (const [op, spec] of Object.entries(OPS)) {
     assert.equal(spec.network === true, NETWORK_OPS.has(op), `OPS.${op} 与 NETWORK_OPS 不一致`)
   }
   for (const op of NETWORK_OPS) {
-    assert.ok(OPS[op] !== undefined, `NETWORK_OPS 里的 ${op} 必须在 OPS 注册表里`)
+    // AUX_NET_OPS 是内部补查命令（'ls-remote'：远端默认分支兜底用），不是面板
+    // 操作，不能要求它在 OPS 注册表里 —— 但必须是显式声明的例外，防止分叉。
+    assert.ok(
+      OPS[op] !== undefined || AUX_NET_OPS.has(op),
+      `NETWORK_OPS 里的 ${op} 必须在 OPS 注册表（或 AUX_NET_OPS 例外）里`,
+    )
   }
 })
 
@@ -397,5 +402,111 @@ test('standalone：目录不存在 / 不是目录 / 不是仓库 / 裸仓库，�
     assert.equal((await readState(join(bare, 'objects'))).notice, BARE_REPO_NOTICE)
   } finally {
     await rm(bare, { recursive: true, force: true })
+  }
+})
+
+// ── 6. 远端默认分支兜底：本地没有 origin/HEAD 时也要能标出默认分支 ────────────
+//
+// 现场：面板靠 `git branch --remotes` 里的 `origin/HEAD -> origin/main` 标默认分支，
+// 而这个符号引用只在 clone（或新版 git 的首次 fetch）时建立 —— `git init` + 手动
+// 加远程（旧版 git）、或从镜像拉取时它都不存在，列表里于是没有任何默认标记。
+// enhanceRemoteBranches 在这些现场用 `git ls-remote --symref` 直接问服务器。
+
+test('standalone：enhanceRemoteBranches 在本地无 origin/HEAD 时补查远程默认分支', async (context) => {
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const run = promisify(execFile)
+  const root = await mkdtemp(join(tmpdir(), 'git-panel-default-'))
+  try {
+    await run('git', ['init', '--bare', '-b', 'main'], { cwd: root })
+  } catch {
+    await rm(root, { recursive: true, force: true })
+    context.skip('本机没有可用的 git')
+    return
+  }
+  const bare = join(root, 'origin.git')
+  const src = join(root, 'src')
+  const work = join(root, 'work')
+  // execFile 要求 cwd 先存在（git init 创建的是仓库，不是目录本身）。
+  await mkdir(src, { recursive: true })
+  await mkdir(work, { recursive: true })
+  try {
+    // 远端仓库：默认分支 main，有一个提交。
+    await run('git', ['init', '-q', '-b', 'main'], { cwd: src })
+    await run('git', ['-C', src, 'config', 'user.email', 't@t'])
+    await run('git', ['-C', src, 'config', 'user.name', 't'])
+    await writeFile(join(src, 'f.txt'), 'x')
+    await run('git', ['-C', src, 'add', 'f.txt'])
+    await run('git', ['-C', src, 'commit', '-qm', 'init'])
+    await run('git', ['clone', '-q', '--bare', src, bare])
+    await run('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: bare })
+
+    // 工作仓库：**故意不 clone** —— 手动加远程、不 fetch，模拟「本地没有
+    // origin/HEAD」的现场（旧版 git 的 init + remote add + fetch 就是这样）。
+    await run('git', ['init', '-q'], { cwd: work })
+    await run('git', ['-C', work, 'remote', 'add', 'origin', bare])
+
+    const { parseRemoteBranchOutput, enhanceRemoteBranches, remoteDefaultBranches } =
+      await import('../lib/index.js')
+
+    // 本地 `git branch --remotes`：什么都没有（连 fetch 都没跑），更没指针。
+    const parsed = parseRemoteBranchOutput('')
+    assert.equal(parsed.defaultRef, null)
+
+    // 兜底：向远端问 HEAD（只读、走本地路径的 git 协议），能拿到 main。
+    const defaults = await remoteDefaultBranches(work)
+    assert.deepEqual(defaults, [{ remote: 'origin', branch: 'main' }])
+
+    // 增强后：items 原样保留，defaults 带回服务器答案（分支还没下载所以没有
+    // 可标记的行，但「谁是默认」已经知道，客户端据此渲染提示行）。
+    const enhanced = await enhanceRemoteBranches(parsed, work)
+    assert.deepEqual(enhanced.items, [])
+    assert.deepEqual(enhanced.defaults, [{ remote: 'origin', branch: 'main' }])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('standalone：enhanceRemoteBranches 在本地有 origin/HEAD 时不发任何查询', async (context) => {
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const run = promisify(execFile)
+  const root = await mkdtemp(join(tmpdir(), 'git-panel-clone-'))
+  try {
+    await run('git', ['init', '--bare', '-b', 'main'], { cwd: root })
+  } catch {
+    await rm(root, { recursive: true, force: true })
+    context.skip('本机没有可用的 git')
+    return
+  }
+  const bare = join(root, 'origin.git')
+  const src = join(root, 'src')
+  const work = join(root, 'work')
+  await mkdir(src, { recursive: true })
+  await mkdir(work, { recursive: true })
+  try {
+    await run('git', ['init', '-q', '-b', 'main'], { cwd: src })
+    await run('git', ['-C', src, 'config', 'user.email', 't@t'])
+    await run('git', ['-C', src, 'config', 'user.name', 't'])
+    await writeFile(join(src, 'f.txt'), 'x')
+    await run('git', ['-C', src, 'add', 'f.txt'])
+    await run('git', ['-C', src, 'commit', '-qm', 'init'])
+    await run('git', ['clone', '-q', '--bare', src, bare])
+    await run('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: bare })
+
+    // 正常 clone：origin/HEAD 由 clone 建立。
+    await run('git', ['clone', '-q', bare, work])
+
+    const { parseRemoteBranchOutput, enhanceRemoteBranches } = await import('../lib/index.js')
+    const parsed = parseRemoteBranchOutput('  origin/HEAD -> origin/main\n  origin/main\n')
+    assert.equal(parsed.defaultRef, 'origin/main')
+    assert.equal(parsed.items.find((item) => item.ref === 'origin/main').head, true)
+
+    // 指针在、也对应得上列表里的分支 → 已知，原样返回，defaults 为空数组
+    //（没有发起任何 ls-remote —— 这条路径不碰网络）。
+    const enhanced = await enhanceRemoteBranches(parsed, work)
+    assert.deepEqual(enhanced, { items: parsed.items, defaultRef: 'origin/main', defaults: [] })
+  } finally {
+    await rm(root, { recursive: true, force: true })
   }
 })

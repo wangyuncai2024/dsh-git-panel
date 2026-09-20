@@ -1176,6 +1176,85 @@ test('client standalone：分支管理器列出远端分支，点「拿成新分
   assert.equal(compares[0].ref, 'origin/main')
 })
 
+test('client standalone：默认分支有独立「默认」徽章、全名进 tooltip、分组顶部有提示行且钉在第一行', async () => {
+  // 回归一：默认标记原先写在名字字符串里（`origin/main（默认）`），名字一被省略号
+  // 截断标记就跟着消失；远端行的 title 又不含 ref，截断后全名无法看到。现在
+  // 「默认」是独立徽章（截图不影响），名字的 tooltip 带完整 ref，分组标题下
+  // 多一行「远端默认分支：…」（本地指针缺失时由宿主补查 remoteBranches.defaults）。
+  // 回归二：默认分支按字母序会夹在几十条分支中间（llama.cpp 的 master 就在第二十几条），
+  // 用户看着像「没下载下来」。渲染时把 head 的那条钉到远端分组**第一行**。
+  const LONG_REF = 'origin/feature/very-long-branch-name-that-will-definitely-be-ellipsized'
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'master', upstream: null,
+    ahead: 0, behind: 0, changes: [], log: [],
+    remotes: [{ name: 'origin', url: 'https://example.com/demo.git' }],
+  }
+  const harness = makeFakeWindow({
+    stateResponse: repoState,
+    opResponses: {
+      branches: {
+        ok: true,
+        branches: { current: 'master', items: [{ name: 'master', current: true }] },
+        remoteBranches: {
+          defaultRef: null, // 本地没有 origin/HEAD（镜像/旧 git 现场）
+          defaults: [{ remote: 'origin', branch: 'main' }],
+          // 刻意让默认分支**不在第一个**：wire 数据是字母序（长分支在前），
+          // 钉到第一行必须是客户端的渲染职责。
+          items: [
+            { remote: 'origin', name: 'feature/very-long-branch-name-that-will-definitely-be-ellipsized',
+              ref: LONG_REF, head: false },
+            { remote: 'origin', name: 'main', ref: 'origin/main', head: true },
+            { remote: 'origin', name: 'dev', ref: 'origin/dev', head: false },
+          ],
+        },
+        state: null,
+      },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+  await findButton(initial, '管理').props.onClick()
+  const opened = await react.settle()
+
+  const texts = flattenTree(opened).map(textOf)
+  // 分组顶部提示行：即使本地没有 origin/HEAD（defaultRef 为 null），宿主的
+  // 补查答案（defaults）也要显示出来 —— 用户一眼知道该拿哪份。
+  assert.ok(
+    texts.some((text) => text.includes('远端默认分支：origin/main')),
+    `应有默认分支提示行，实际：${JSON.stringify(texts.slice(0, 30))}`,
+  )
+  // 「默认」徽章独立于名字存在（不再是名字后缀），且不包含在名字文本里 ——
+  // 名字被 CSS 截断时徽章仍完整可见。
+  assert.ok(
+    texts.some((text) => text === '默认'),
+    `应有独立的「默认」徽章文本，实际：${JSON.stringify(texts.slice(0, 30))}`,
+  )
+  // tooltip 必须带完整 ref：长分支名被省略号截断后，悬停仍能看到全名。
+  const titled = flattenTree(opened).filter((node) => typeof node.props.title === 'string')
+  assert.ok(
+    titled.some((node) => node.props.title.startsWith(LONG_REF)),
+    `长分支名的 tooltip 要带完整 ref，实际：${JSON.stringify(titled.map((node) => node.props.title).slice(0, 10))}`,
+  )
+  const badge = flattenTree(opened).find((node) => node.type === 'span' && textOf(node) === '默认')
+  assert.ok(badge !== undefined && typeof badge.props.title === 'string' && badge.props.title.includes('origin/main'),
+    '默认徽章要注明它指哪个分支')
+  // 名字文本本身不再带「（默认）」后缀（截断会吃掉它）。
+  assert.ok(!texts.some((text) => text.includes('（默认）')), '默认标记不再作为名字后缀显示')
+
+  // 渲染顺序：默认分支必须排在整个远端分组的第一行（wire 数据里它在中间）。
+  const remoteNameSpans = flattenTree(opened).filter((node) =>
+    node.type === 'span' && typeof node.props.title === 'string'
+    && node.props.title.startsWith('origin/'))
+  const titles = remoteNameSpans.map((node) => node.props.title)
+  const mainPos = titles.findIndex((text) => text.startsWith('origin/main'))
+  const longPos = titles.findIndex((text) => text.startsWith(LONG_REF))
+  const devPos = titles.findIndex((text) => text.startsWith('origin/dev'))
+  assert.ok(mainPos === 0, `默认分支要钉在远端分组第一行，实际顺序：${JSON.stringify(titles)}`)
+  assert.ok(longPos > mainPos && devPos > mainPos, `其余分支仍按 ref 排序，实际顺序：${JSON.stringify(titles)}`)
+})
+
 // ── 8. 新增契约：宿主诊断必须可见 / 截断必须说出来 / noState / reset-repo ─────
 
 test('client standalone：宿主给的 notice 必须显示出来（回归：宿主算了却没人读）', async () => {

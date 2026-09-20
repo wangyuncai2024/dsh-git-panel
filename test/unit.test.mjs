@@ -21,6 +21,7 @@ import {
   normalizeDir,
   parseBranchOutput,
   parseRemoteBranchOutput,
+  parseLsRemoteHead,
   isSafeRemoteRef,
   parseCompareOutput,
   pickRemoteDefaultBranch,
@@ -294,6 +295,17 @@ test('parseRemoteBranchOutput：只有 HEAD 指针（远端分支还没下载下
 test('parseRemoteBranchOutput：空输出 / 非分支行都被忽略', () => {
   assert.deepEqual(parseRemoteBranchOutput(''), { items: [], defaultRef: null })
   assert.deepEqual(parseRemoteBranchOutput('  main\n  origin/\n'), { items: [], defaultRef: null })
+})
+
+// ── parseLsRemoteHead：git ls-remote --symref <远程> HEAD（默认分支兜底） ──
+
+test('parseLsRemoteHead：符号引用行给出分支名（tab 分隔）', () => {
+  assert.equal(parseLsRemoteHead('ref: refs/heads/master\tHEAD\n'), 'master')
+  assert.equal(parseLsRemoteHead('ref: refs/heads/feature/llama-4\tHEAD\n'), 'feature/llama-4')
+  // 老服务器不认 --symref，只回哈希行 —— 解析不出名字，返回 null 而不是瞎猜。
+  assert.equal(parseLsRemoteHead('3d82ef62d47fd74e18f36c5eccbdcf965b617b17\tHEAD\n'), null)
+  assert.equal(parseLsRemoteHead(''), null)
+  assert.equal(parseLsRemoteHead(null), null)
 })
 
 // ── isSafeRemoteRef：远端引用会作为参数交给 git，必须先校验 ────────────────
