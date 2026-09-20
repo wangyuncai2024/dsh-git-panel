@@ -702,3 +702,149 @@ test('standalone：stashPull —— 弹回改动时冲突：拉取完成、stash
     await rm(root, { recursive: true, force: true })
   }
 })
+
+// ── 「安全切分支」（stashSwitch）：脏工作区也能切分支 ──────────────────────
+//
+// 与 stashPull 对称：git 的裸 switch 在脏工作区上会被拒绝（Your local changes
+// would be overwritten），这里做成 stash push -u → switch → stash pop。
+// 唯一不能退化的属性同样是「改动一件不少」。
+
+test('standalone：stashSwitch —— 有改动时藏起→切换→恢复，一件不少', async (context) => {
+  const { stashSwitch, runGit } = await import('../lib/index.js')
+  const fixture = await stashPullFixture(context)
+  if (fixture === null) return
+  const { run, root, work } = fixture
+  try {
+    // 先造一条要切换过去的分支（内容与 main 不同，便于确认真的切过去了）。
+    await run('git', ['-C', work, 'switch', '-q', '-c', 'feature'])
+    await writeFile(join(work, 'feature.txt'), 'feature 分支的内容\n')
+    await run('git', ['-C', work, 'add', 'feature.txt'])
+    await run('git', ['-C', work, 'commit', '-qm', 'F'])
+    await run('git', ['-C', work, 'switch', '-q', 'main'])
+
+    // main 上留两处改动：已跟踪文件 + 未跟踪文件。
+    await writeFile(join(work, 'f.txt'), '本地第一版\n我的本地改动\n')
+    await writeFile(join(work, 'u.txt'), '还没加入版本库\n')
+
+    const payload = await stashSwitch({ branch: 'feature' }, work)
+
+    assert.equal(payload.ok, true, '有改动的安全切分支应该成功：' + JSON.stringify(payload))
+    const head = await runGit(['branch', '--show-current'], work, { timeoutMs: 20000 })
+    assert.equal(head.stdout.trim(), 'feature', '应该真的切到 feature 分支上了')
+    assert.equal(await readFile(join(work, 'f.txt'), 'utf8'), '本地第一版\n我的本地改动\n',
+      '已跟踪文件的改动要原样恢复')
+    assert.equal(await readFile(join(work, 'u.txt'), 'utf8'), '还没加入版本库\n', '未跟踪文件要原样恢复')
+    const stash = await runGit(['stash', 'list'], work, { timeoutMs: 20000 })
+    assert.equal(stash.stdout.trim(), '', '成功后 stash 应该清空（改动已经弹回，不留备份）')
+    assert.ok(payload.notes.some((note) => note.includes('已切换到 feature')),
+      '结果栏要说清切到了哪里：' + JSON.stringify(payload.notes))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('standalone：stashSwitch —— 目标分支不存在时把改动还回工作区，不留底', async (context) => {
+  const { stashSwitch, runGit } = await import('../lib/index.js')
+  const fixture = await stashPullFixture(context)
+  if (fixture === null) return
+  const { root, work } = fixture
+  try {
+    await writeFile(join(work, 'f.txt'), '本地第一版\n我的本地改动\n')
+    await writeFile(join(work, 'u.txt'), '还没加入版本库\n')
+
+    const payload = await stashSwitch({ branch: '不存在的分支' }, work)
+
+    assert.equal(payload.ok, false, '分支不存在时必须失败')
+    const head = await runGit(['branch', '--show-current'], work, { timeoutMs: 20000 })
+    assert.equal(head.stdout.trim(), 'main', '切换失败时不能把用户带到别的分支上')
+    assert.equal(await readFile(join(work, 'f.txt'), 'utf8'), '本地第一版\n我的本地改动\n',
+      '切换失败要把改动原样还回工作区')
+    assert.equal(await readFile(join(work, 'u.txt'), 'utf8'), '还没加入版本库\n', '未跟踪文件也要还回来')
+    const stash = await runGit(['stash', 'list'], work, { timeoutMs: 20000 })
+    assert.equal(stash.stdout.trim(), '', '改动已经弹回，不该在 stash 里留备份')
+    assert.ok(payload.notes.some((note) => note.includes('还给了工作区')),
+      '结果栏要说明改动已经回来了：' + JSON.stringify(payload.notes))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('standalone：stashSwitch —— 工作区干净时就是一条普通 switch，不制造 stash', async (context) => {
+  const { stashSwitch, runGit } = await import('../lib/index.js')
+  const fixture = await stashPullFixture(context)
+  if (fixture === null) return
+  const { run, root, work } = fixture
+  try {
+    await run('git', ['-C', work, 'switch', '-q', '-c', 'feature'])
+    await run('git', ['-C', work, 'switch', '-q', 'main'])
+
+    const payload = await stashSwitch({ branch: 'feature' }, work)
+    assert.equal(payload.ok, true, '干净工作区应该直接切成功：' + JSON.stringify(payload))
+    const stash = await runGit(['stash', 'list'], work, { timeoutMs: 20000 })
+    assert.equal(stash.stdout.trim(), '', '干净工作区不应该产生 stash')
+    const head = await runGit(['branch', '--show-current'], work, { timeoutMs: 20000 })
+    assert.equal(head.stdout.trim(), 'feature')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+// ── 新增操作走一遍真实的 op 流水线（含 field/parse 接线） ──────────────────
+//
+// 上面那些是逐段验证；这里把 routes.js 的 runPanelOp 真跑一遍：argv 构造 → 执行
+// → 结果解析 → 响应字段。数据型操作的价值全在「解析出来的字段」上，只断言 argv
+// 是发现不了「解析函数没挂上、面板永远读不到 show/stash」这类问题的。
+
+test('standalone：show / stashList / 单文件暂存与还原在真 git 里跑通', async (context) => {
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const run = promisify(execFile)
+  const { runPanelOp } = await import('../lib/routes.js')
+
+  const root = await mkdtemp(join(tmpdir(), 'git-panel-ops-'))
+  try {
+    try {
+      await run('git', ['init', '-q', '-b', 'main'], { cwd: root })
+    } catch {
+      await rm(root, { recursive: true, force: true })
+      context.skip('本机没有可用的 git')
+      return
+    }
+    await run('git', ['-C', root, 'config', 'user.email', 't@t'])
+    await run('git', ['-C', root, 'config', 'user.name', 't'])
+    await writeFile(join(root, 'f.txt'), '第一版\n')
+    await run('git', ['-C', root, 'add', 'f.txt'])
+    await run('git', ['-C', root, 'commit', '-qm', '第一次提交'])
+
+    // 1) show：点最近提交那一行的详情。
+    const show = await runPanelOp('show', { ref: 'HEAD' }, root)
+    assert.equal(show.payload.ok, true, 'git show 应该成功：' + JSON.stringify(show.payload.message))
+    assert.ok(typeof show.payload.show === 'string' && show.payload.show.length > 0, 'show 字段要有内容')
+    assert.ok(show.payload.show.includes('第一次提交'), '详情里应包含提交信息：' + show.payload.show.slice(0, 120))
+    assert.ok(show.payload.show.includes('f.txt'), '--stat 要列出改动的文件')
+
+    // 2) 单文件暂存 / 取消暂存：要真的改变暂存区。
+    await writeFile(join(root, 'f.txt'), '第一版\n第二行\n')
+    const staged = await runPanelOp('add', { path: 'f.txt' }, root)
+    assert.equal(staged.payload.ok, true, '单文件暂存应该成功')
+    const porcelainAfterAdd = await run('git', ['-C', root, 'status', '--porcelain'])
+    assert.ok(porcelainAfterAdd.stdout.startsWith('M '), '暂存后应显示为已暂存：' + porcelainAfterAdd.stdout)
+
+    const unstaged = await runPanelOp('unstageFile', { path: 'f.txt' }, root)
+    assert.equal(unstaged.payload.ok, true, '取消暂存应该成功')
+    const porcelainAfterUnstage = await run('git', ['-C', root, 'status', '--porcelain'])
+    // 注意不能 trim：porcelain 的「未暂存」正是开头那个空格（XY 两列里的 X）。
+    assert.ok(porcelainAfterUnstage.stdout.startsWith(' M'), '取消暂存后应回到未暂存：' + porcelainAfterUnstage.stdout)
+
+    // 3) stashList：stash 的编号必须被解析出来（面板要靠它恢复/删除）。
+    await run('git', ['-C', root, 'stash', 'push', '-u', '-m', '测试备份'])
+    const list = await runPanelOp('stashList', {}, root)
+    assert.equal(list.payload.ok, true)
+    assert.equal(Array.isArray(list.payload.stash), true, 'stash 字段应是数组')
+    assert.equal(list.payload.stash.length, 1)
+    assert.equal(list.payload.stash[0].ref, 'stash@{0}', '编号必须原样解析（它是要交给 git 的参数）')
+    assert.ok(list.payload.stash[0].text.includes('测试备份'), '说明文字要带出来：' + list.payload.stash[0].text)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

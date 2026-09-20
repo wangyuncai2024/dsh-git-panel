@@ -24,10 +24,19 @@ import {
   parseLsRemoteHead,
   isSafeRemoteRef,
   parseCompareOutput,
+  parseStashList,
   pickRemoteDefaultBranch,
   buildOpArgv,
   unrelatedChoices,
   pullHint,
+  classifyCommitFailure,
+  commitHint,
+  classifyCheckoutFailure,
+  checkoutHint,
+  classifyPullFailure,
+  opTimeoutMs,
+  OPS,
+  GIT_LOCAL_TIMEOUT_MS,
   truncateText,
   renderHelpHtml,
   escapeHtml,
@@ -132,11 +141,113 @@ test('classifyPushFailure：空输出 → none', () => {
 // ── pushHint：失败原因 → 中文下一步提示 ───────────────────────────────────
 
 test('pushHint：每个已知原因都有提示，none 返回 null', () => {
-  for (const reason of ['no-remote', 'no-upstream', 'remote-not-found', 'auth-failed', 'rejected']) {
+  for (const reason of ['no-remote', 'no-upstream', 'remote-not-found', 'auth-failed', 'auth-http', 'rejected']) {
     assert.equal(typeof pushHint(reason), 'string', reason + ' 应有提示')
     assert.ok(pushHint(reason).length > 0, reason + ' 提示非空')
   }
   assert.equal(pushHint('none'), null)
+})
+
+// ── 新增失败分类：HTTPS 认证失败（push / pull 两侧） ──────────────────────
+//
+// 回归：原先只认 SSH 的 `Permission denied (publickey)`，HTTPS 走 GitHub 时
+// `Authentication failed` / `could not read Username` 全部落到 none ——
+// 面板只能把 git 英文原文甩给用户，而这是新手在 HTTPS 推送时最常见的一条。
+
+const AUTH_HTTP_CASES = [
+  ["fatal: Authentication failed for 'https://github.com/o/r.git/'", 'auth-http'],
+  ["fatal: could not read Username for 'https://github.com': terminal prompts disabled", 'auth-http'],
+]
+
+for (const [stderr, expected] of AUTH_HTTP_CASES) {
+  test('classifyPushFailure（HTTPS 认证）：' + stderr.slice(0, 32) + '… → ' + expected, () => {
+    assert.equal(classifyPushFailure(stderr), expected)
+  })
+  test('classifyPullFailure（HTTPS 认证）：' + stderr.slice(0, 32) + '… → ' + expected, () => {
+    assert.equal(classifyPullFailure(stderr), expected)
+  })
+}
+
+test('auth-http 的提示必须指向令牌与 credential.helper，而不是 SSH 公钥', () => {
+  const push = pushHint('auth-http')
+  assert.match(push, /Token/i, '要说明 GitHub 不再支持密码、需要令牌')
+  assert.match(push, /credential\.helper/)
+  assert.doesNotMatch(push, /公钥/)
+  const pull = pullHint('auth-http')
+  assert.match(pull, /Token/i)
+  assert.match(pull, /credential\.helper/)
+})
+
+test('classifyPushFailure：SSH 认证仍走 auth-failed（两条不能互相顶掉）', () => {
+  assert.equal(classifyPushFailure('Permission denied (publickey).'), 'auth-failed')
+  assert.equal(classifyPushFailure('git@github.com: Permission denied (publickey).'), 'auth-failed')
+})
+
+// ── 提交失败单独分类：身份没配置 / 没有可提交的内容 ──────────────────────
+
+test('classifyCommitFailure：git 不知道你是谁时给出 identity-missing', () => {
+  for (const text of [
+    '*** Please tell me who you are.\n\nRun\n\n  git config --global user.email "you@example.com"',
+    'fatal: unable to auto-detect email address (got \'x@y.(none)\')',
+    'Author identity unknown',
+  ]) {
+    assert.equal(classifyCommitFailure(text), 'identity-missing', text.slice(0, 30))
+  }
+})
+
+test('classifyCommitFailure：工作区干净时给出 nothing-to-commit', () => {
+  assert.equal(classifyCommitFailure('nothing to commit, working tree clean'), 'nothing-to-commit')
+  assert.equal(classifyCommitFailure('无文件要提交，干净的工作区'), 'nothing-to-commit')
+})
+
+test('classifyCommitFailure：别的失败仍是 none', () => {
+  assert.equal(classifyCommitFailure('fatal: something else'), 'none')
+  assert.equal(classifyCommitFailure(''), 'none')
+})
+
+test('commitHint：身份问题必须给出两条确切的配置命令', () => {
+  const hint = commitHint('identity-missing')
+  assert.match(hint, /user\.name/)
+  assert.match(hint, /user\.email/)
+  assert.match(commitHint('nothing-to-commit'), /暂存/)
+  assert.equal(commitHint('none'), null)
+})
+
+// ── 切换分支失败单独分类：脏工作区 / 分支不存在 ──────────────────────────
+
+test('classifyCheckoutFailure：脏工作区与分支不存在分开认', () => {
+  assert.equal(
+    classifyCheckoutFailure('error: Your local changes to the following files would be overwritten by checkout:\n\tf.txt'),
+    'dirty-worktree',
+  )
+  assert.equal(
+    classifyCheckoutFailure('error: The following untracked working tree files would be overwritten by checkout:\n\tu.txt'),
+    'dirty-worktree',
+  )
+  assert.equal(classifyCheckoutFailure("fatal: invalid reference: nope"), 'branch-missing')
+  assert.equal(classifyCheckoutFailure('fatal: something else'), 'none')
+})
+
+test('checkoutHint：脏工作区要指向「安全切分支」，分支不存在要指向新建', () => {
+  const dirty = checkoutHint('dirty-worktree')
+  assert.match(dirty, /安全切分支/, '要把面板上真正能救场的那条路说出来')
+  assert.match(checkoutHint('branch-missing'), /新建/)
+  assert.equal(checkoutHint('none'), null)
+})
+
+// ── parseStashList：git stash list（面板「stash 备份」） ────────────────────
+
+test('parseStashList：编号与说明分开取，编号必须原样（它是会交给 git 的参数）', () => {
+  assert.deepEqual(parseStashList('stash@{0}: WIP on main: 1234abc 提交说明\nstash@{1}: On dev: 手头的改动\n'), [
+    { ref: 'stash@{0}', text: 'WIP on main: 1234abc 提交说明' },
+    { ref: 'stash@{1}', text: 'On dev: 手头的改动' },
+  ])
+})
+
+test('parseStashList：空输出与不成形的行都跳过（宁可少列一条，不能拼错编号）', () => {
+  assert.deepEqual(parseStashList(''), [])
+  assert.deepEqual(parseStashList('stash@{x}: 坏的\n随便一行\n'), [])
+  assert.deepEqual(parseStashList(null), [])
 })
 
 // ── remoteOpFor：配置推送目标（面板 setRemote 与工具 git_remote set 共用） ─
@@ -387,6 +498,60 @@ test('buildOpArgv：compare 用 HEAD...<ref>，ref 非法时明确报错', async
   await assert.rejects(() => buildOpArgv('compare', {}), /远端分支/)
 })
 
+// ── 新增操作的 argv：单文件暂存/还原、提交详情、stash、改名、变基 ─────────
+
+test('buildOpArgv：单文件暂存 / 取消暂存 / 还原都带 `--` 分隔符', async () => {
+  assert.deepEqual(await buildOpArgv('add', { path: 'a b.txt' }), ['add', '--', 'a b.txt'])
+  assert.deepEqual(await buildOpArgv('unstageFile', { path: 'a.txt' }), ['restore', '--staged', '--', 'a.txt'])
+  assert.deepEqual(await buildOpArgv('restoreFile', { path: 'a.txt' }), ['restore', '--', 'a.txt'])
+  // 路径缺失是可展示的中文错误，而不是拼出一条 `git add --` 去执行。
+  await assert.rejects(() => buildOpArgv('add', {}), /文件路径/)
+  await assert.rejects(() => buildOpArgv('restoreFile', {}), /文件路径/)
+})
+
+test('buildOpArgv：提交详情带 --stat 与完整作者信息，并走本地超时档', async () => {
+  const argv = await buildOpArgv('show', { ref: 'abc1234' })
+  assert.deepEqual(argv, ['show', '--no-color', '--stat', '--format=fuller', 'abc1234'])
+  assert.equal(opTimeoutMs(OPS.show), GIT_LOCAL_TIMEOUT_MS, '本地命令不该按两分钟预算等')
+  await assert.rejects(() => buildOpArgv('show', {}), /提交号/)
+})
+
+test('buildOpArgv：stash 应用/删除只接受 stash@{n} 形态的编号', async () => {
+  assert.deepEqual(await buildOpArgv('stashApply', { ref: 'stash@{0}' }), ['stash', 'apply', 'stash@{0}'])
+  assert.deepEqual(await buildOpArgv('stashDrop', { ref: 'stash@{12}' }), ['stash', 'drop', 'stash@{12}'])
+  // 编号会作为参数交给 git，形状不对必须当场拒绝（否则可能 drop 到别的东西上）。
+  await assert.rejects(() => buildOpArgv('stashDrop', { ref: 'HEAD' }), /stash/)
+  await assert.rejects(() => buildOpArgv('stashApply', { ref: '-x' }), /stash/)
+  await assert.rejects(() => buildOpArgv('stashDrop', {}), /stash/)
+})
+
+test('buildOpArgv：分支改名与暂存列表', async () => {
+  assert.deepEqual(await buildOpArgv('renameBranch', { name: 'main' }), ['branch', '-m', 'main'])
+  await assert.rejects(() => buildOpArgv('renameBranch', { name: '-x' }), /分支名/)
+  await assert.rejects(() => buildOpArgv('renameBranch', {}), /新分支名/)
+  assert.deepEqual(await buildOpArgv('stashList', {}), ['stash', 'list'])
+})
+
+test('buildOpArgv：pull 的 rebase 开关来自请求体，默认不加', async () => {
+  assert.deepEqual(await buildOpArgv('pull', {}), ['pull'])
+  assert.deepEqual(await buildOpArgv('pull', { rebase: true }), ['pull', '--rebase'])
+})
+
+test('buildOpArgv：commit 的 amend 开关', async () => {
+  assert.deepEqual(await buildOpArgv('commit', { message: 'x' }), ['commit', '-m', 'x'])
+  assert.deepEqual(await buildOpArgv('commit', { message: 'x', amend: true }), ['commit', '--amend', '-m', 'x'])
+})
+
+test('opTimeoutMs：数据型/本地操作用 20 秒档，联网操作用 10 分钟档', () => {
+  // 600000 = NETWORK_OP_TIMEOUT_MS（联网操作 10 分钟预算，见 ops.js）。
+  for (const op of ['diff', 'branches', 'remoteBranches', 'compare', 'show', 'stashList']) {
+    assert.equal(opTimeoutMs(OPS[op]), GIT_LOCAL_TIMEOUT_MS, op + ' 应该走本地档')
+  }
+  for (const op of ['pull', 'push', 'fetch', 'clone']) {
+    assert.equal(opTimeoutMs(OPS[op]), 600000, op + ' 是联网操作，要给足预算')
+  }
+})
+
 // ── 「两套历史互不相关」的两个选择必须带着远端分支名 ──────────────────────
 //
 // 回归：按钮原先只回 { mode }，adoptRemote 于是按「当前分支名」去拼 remoteRef。
@@ -465,9 +630,21 @@ test('renderHelpHtml：命令里的引号被转义进属性，不会截断 HTML'
   assert.ok(html.includes('data-cmd="git tag -a v1.0 -m &quot;版本说明&quot;"'))
 })
 
-// ── 日志模块（临时 DSH_HOME，不碰用户真实主目录） ──────────────────────────
+// ── 日志模块（临时目录，不碰用户真实主目录、也不写进仓库根） ────────────────
+//
+// 日志**默认**落在启动 dsh 时的工作区目录（process.cwd()），所以这里每个用例都
+// 显式把 logFile 指到临时目录：否则用例之间、乃至并行运行的其它测试文件会一起
+// 往工作区那个 git-panel.log 里写，行数断言立刻变成随机的。
 
 let logHome = null
+
+/** 本段用例共用的日志文件（临时目录里的那个）。 */
+const logPath = () => join(logHome, 'git-panel.log')
+
+/** 设置日志配置，并强制把文件钉在临时目录。 */
+function useLog(options = {}) {
+  setLogConfig(Object.assign({}, options, { file: logPath() }))
+}
 
 before(async () => {
   logHome = await mkdtemp(join(tmpdir(), 'git-panel-log-'))
@@ -477,6 +654,11 @@ before(async () => {
 after(async () => {
   setLogConfig({})
   if (logHome !== null) await rm(logHome, { recursive: true, force: true })
+})
+
+test('日志：默认落在启动目录（工作区），不再写进 $DSH_HOME', () => {
+  setLogConfig({})
+  assert.equal(logFilePath(), join(process.cwd(), 'git-panel.log'))
 })
 
 test('日志：级别归一化 —— 非法/缺省落 info，off 是可用的合法值', () => {
@@ -500,20 +682,20 @@ test('日志：轮转上限归一化 —— 非正数落默认值', () => {
 })
 
 test('日志：shouldLog 按当前级别过滤', () => {
-  setLogConfig({ level: 'warn' })
+  useLog({ level: 'warn' })
   assert.equal(shouldLog('error'), true)
   assert.equal(shouldLog('warn'), true)
   assert.equal(shouldLog('info'), false)
   assert.equal(shouldLog('debug'), false)
-  setLogConfig({ level: 'off' })
+  useLog({ level: 'off' })
   assert.equal(shouldLog('error'), false)
-  setLogConfig({})
+  useLog()
 })
 
 test('日志：appendLog 写 JSONL，字段齐全且可解析', async () => {
-  setLogConfig({ level: 'debug' })
+  useLog({ level: 'debug' })
   const path = logFilePath()
-  assert.equal(path, join(logHome, 'git-panel.log'))
+  assert.equal(path, logPath())
   await rm(path, { force: true })
   await appendLog('info', 'op', { op: 'push', dir: '/tmp/x', argv: ['push'], exit: 0, ms: 12 })
   const text = await readFile(path, 'utf8')
@@ -523,11 +705,11 @@ test('日志：appendLog 写 JSONL，字段齐全且可解析', async () => {
   assert.equal(parsed.op, 'push')
   assert.equal(parsed.exit, 0)
   assert.ok(typeof parsed.at === 'string' && parsed.at.length > 0, '要有时间戳')
-  setLogConfig({})
+  useLog()
 })
 
 test('日志：级别过滤生效 —— info 级别下 debug 事件不落盘', async () => {
-  setLogConfig({ level: 'info' })
+  useLog({ level: 'info' })
   const path = logFilePath()
   await rm(path, { force: true })
   await appendLog('debug', 'git', { argv: ['status'] })
@@ -535,11 +717,11 @@ test('日志：级别过滤生效 —— info 级别下 debug 事件不落盘', 
   const text = await readFile(path, 'utf8')
   assert.ok(!text.includes('"event":"git"'), 'debug 事件不该出现在 info 日志里')
   assert.ok(text.includes('"event":"op"'), 'warn 事件应该落盘')
-  setLogConfig({})
+  useLog()
 })
 
 test('日志：超过上限自动轮转，只保留当前与 .1 两份', async () => {
-  setLogConfig({ level: 'debug', maxBytes: 200 })
+  useLog({ level: 'debug', maxBytes: 200 })
   const path = logFilePath()
   await rm(path, { force: true })
   await rm(path + '.1', { force: true })
@@ -551,11 +733,11 @@ test('日志：超过上限自动轮转，只保留当前与 .1 两份', async (
   assert.ok(current.size <= 200 + 200, '当前文件应被控制在轮转阈值附近（有一条是「跨过线」的那条）')
   const backup = await stat(path + '.1')
   assert.ok(backup.size > 0, '旧日志应被改名成 .1')
-  setLogConfig({})
+  useLog()
 })
 
 test('日志：readLogTail 只读尾部指定行数', async () => {
-  setLogConfig({ level: 'debug' })
+  useLog({ level: 'debug' })
   const path = logFilePath()
   await rm(path, { force: true })
   for (let index = 0; index < 10; index += 1) {
@@ -570,7 +752,7 @@ test('日志：readLogTail 只读尾部指定行数', async () => {
   const fallback = await readLogTail(0)
   assert.equal(fallback.length, 10, '非正行数按默认值（取全部），但不该抛异常')
   assert.equal((await readLogTail(-3)).length, 10)
-  setLogConfig({})
+  useLog()
 })
 
 test('日志：readLogTail 文件不存在时返回空数组而不是抛异常', async () => {

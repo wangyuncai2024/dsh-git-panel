@@ -36,6 +36,7 @@ import {
   mirrorLabel,
   probeJobs,
   MIRROR_CANDIDATES,
+  resetCsrfTokens,
 } from '../lib/index.js'
 
 const DEFAULT_MIRROR = MIRROR_CANDIDATES[0].prefix
@@ -303,9 +304,10 @@ test('network：[探测] 代理那条线路也必须带 -c（回归：探测里�
     assert.match(job.url, /^https:\/\/[^/]+\/https:\/\/github\.com\//, '镜像地址应该是「镜像前缀 + 原地址」：' + job.url)
   }
 
-  // 直连永远排第一，且不带任何参数。
+  // 直连排第一，且**显式清掉全局代理**：用户 ~/.gitconfig 里配了 http.proxy 时，
+  // 不显式清空的话「直连通」其实是代理在通，探测结论会把用户引偏。
   assert.equal(jobs[0].kind, 'direct')
-  assert.deepEqual(jobs[0].args, [])
+  assert.deepEqual(jobs[0].args, ['-c', 'http.proxy=', '-c', 'https.proxy='])
 
   // 没配代理就不该有代理那条（否则会多等一个必然失败的超时）。
   assert.equal(probeJobs({}).some((job) => job.kind === 'proxy'), false)
@@ -333,6 +335,10 @@ after(async () => {
 beforeEach(async () => {
   process.env.DSH_HOME = home
   resetNetConfigCache()
+  // 会话令牌是模块级的：用例之间必须回到「还没发放过」的干净状态，否则前一个
+  // 用例 GET 出来的令牌会让后一个用例的 POST 被 403 挡掉（那正是加固生效的样子，
+  // 但对「只测 op 流水线」的用例来说是噪音）。
+  resetCsrfTokens()
   await rm(netConfigPath(), { force: true })
 })
 
@@ -481,12 +487,13 @@ test('network：[路由] POST 把打码串理解成「不变」，不会把真�
   await writeNetConfig({ proxy: 'http://user:secret@127.0.0.1:7890' })
   const { net } = mountRoutes()
 
-  // 模拟面板行为：拿到打码的视图，改了个无关开关，把 proxy 原样回传。
+  // 模拟面板行为：拿到打码的视图，改了个无关开关，把 proxy 与**会话令牌**原样回传。
   const view = (await callRoute(net, { method: 'GET' })).data
+  assert.ok(typeof view.csrf === 'string' && view.csrf.length > 0, 'GET 要发放会话令牌')
   const saved = await callRoute(net, {
     method: 'POST',
     headers: SAME_ORIGIN,
-    body: { mirrorEnabled: true, proxy: view.proxy },
+    body: { mirrorEnabled: true, proxy: view.proxy, csrf: view.csrf },
   })
 
   assert.equal(saved.data.ok, true)
@@ -494,6 +501,38 @@ test('network：[路由] POST 把打码串理解成「不变」，不会把真�
   assert.equal(saved.data.hasProxy, true, '凭据不能被 *** 覆盖掉')
   resetNetConfigCache()
   assert.equal((await readNetConfig()).proxy, 'http://user:secret@127.0.0.1:7890')
+})
+
+test('network：[路由] 发放过令牌之后，没带令牌的 POST 一律 403（CSRF 加固）', async () => {
+  const { net } = mountRoutes()
+  // 先 GET 一次（等价于浏览器加载页面），此时令牌已存在。
+  const view = (await callRoute(net, { method: 'GET' })).data
+
+  // 没有令牌（真实 CSRF 场景：跨站页面能发出请求，但读不到响应体里的令牌）。
+  const blocked = await callRoute(net, {
+    method: 'POST',
+    headers: SAME_ORIGIN,
+    body: { mirrorEnabled: true },
+  })
+  assert.equal(blocked.status, 403)
+  assert.equal(blocked.data.ok, false)
+  assert.match(String(blocked.data.message), /令牌/)
+
+  // 拿错令牌同样拒绝。
+  const wrong = await callRoute(net, {
+    method: 'POST',
+    headers: SAME_ORIGIN,
+    body: { mirrorEnabled: true, csrf: 'f'.repeat(32) },
+  })
+  assert.equal(wrong.status, 403)
+
+  // 带上正确的令牌才放行。
+  const ok = await callRoute(net, {
+    method: 'POST',
+    headers: SAME_ORIGIN,
+    body: { mirrorEnabled: true, csrf: view.csrf },
+  })
+  assert.equal(ok.data.ok, true)
 })
 
 test('network：[路由] POST 跨站来源被拒绝（该接口决定 git 命令怎么执行）', async () => {
@@ -684,16 +723,19 @@ test('network：[集成] 参数非法时的早期错误响应形状与成功分�
 // ── 8. 路由集成：/git-panel/log（日志尾读） ─────────────────────────────────
 
 test('network：[路由] 注册了 log 路由，GET 返回最近日志行，重参数不炸', async () => {
-  const { apply } = await import('../lib/index.js')
+  const { apply, setLogConfig } = await import('../lib/index.js')
   const harness = makeCtx()
   apply(harness.ctx, {})
   const logRoute = harness.routes.find((route) => route.path === '/git-panel/log')
   assert.ok(logRoute !== undefined, '应注册 /git-panel/log')
 
-  // 先造几条日志（写进临时 DSH_HOME 的 git-panel.log）。
+  // 日志默认落在**启动目录**（工作区），测试里显式指到临时目录，别把用例的
+  // 记录写进仓库根：apply 之后显式设置，是因为 apply 会用行配置覆盖一次日志配置。
+  const path = join(home, 'git-panel.log')
+  setLogConfig({ file: path })
   const { appendLog, logFilePath } = await import('../lib/index.js')
-  const path = logFilePath()
-  assert.equal(path, join(home, 'git-panel.log'), '日志应落在 DSH_HOME 下')
+  assert.equal(logFilePath(), path, '显式配置的日志路径应生效')
+  await rm(path, { force: true })
   await appendLog('info', 'op', { op: 'fake', exit: 0, n: 1 })
   await appendLog('warn', 'op', { op: 'fake', exit: 128, n: 2 })
 

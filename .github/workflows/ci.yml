@@ -1,0 +1,32 @@
+# dsh-git-panel —— 换机器 / 换 DSH 版本的第一道回归
+#
+# README 里反复强调「换机器、换 DSH 版本时先跑一次 npm test」：它覆盖的是
+# 插件自身的加载与注册契约（apply 的四种时机、13 个工具的 schema、
+# 面板与工具的 argv 一致、客户端 bundle 的格式），这些一旦坏掉，
+# 通常表现为「界面还在、功能静默失灵」。把这条防线放进 CI，就不必再靠人的自觉。
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # engines 声明的是 ^22.19.0 || >=24.0.0，两个都跑。
+        node: ['22.19.0', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # 零依赖插件：没有 npm install 这一步（dependencies 为空）。
+      - name: 语法检查
+        run: npm run check
+
+      - name: 测试
+        run: npm test

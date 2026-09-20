@@ -21,6 +21,19 @@ DSH（DeepSeek Harness）Git 面板插件：在界面右下角提供一个**纯�
 | 仓库页 ↗ | 远程地址能推导成网页地址（GitHub / GitLab / Gitee… 的 https / ssh / scp 风格）时，「远程」行出现该链接：点击**直接在新标签页打开仓库主页**，不用复制地址再去浏览器粘贴。本地路径等推导不出的地址不显示，绝不给死链 |
 | 分支管理 | 打开后列出**本地分支**：点名字**切换**、输入名字**新建并切换**、按钮**安全删除**（未合并的分支会被拒绝，防误删历史）；同时列出**远端分支**（`git branch --remotes`，获取远程之后可见）：点「拿成新分支」把远端那一份取成本地新分支（当前分支一点不动），点「比较」看两边各差几个提交。点远端分支**不会**直接切过去——那会变成游离 HEAD。**远端默认分支**钉在远端分组的第一行（其余仍按字母序），分组顶部写明「远端默认分支：origin/main」，对应行带独立的「默认」徽章——本地没有 `origin/HEAD` 指针（旧版 git 的 init+远程、镜像远端）或指针过期时，面板会自动向服务器补问一次（`git ls-remote --symref`，只读、照常走镜像/代理），不会因此变成「找不到默认分支」。分支名被省略号截断时**悬停能看到全名**（tooltip 带完整 ref） |
 | 改动点开看 diff | 改动清单里点任意条目，diff **就在这一行下面展开**（清单不会被顶掉、也不会被盖住），展开中的那一行带品牌色竖条；已暂存条目看的是暂存区版本，再点一次收起 |
+| 单文件暂存 / 取消暂存 / 还原 | 每一行改动右侧带自己的小按钮：未暂存给「暂存」（未跟踪文件也能加进来）、已暂存给「取消暂存」（只动暂存区，工作区内容保留）；**工作区确实有改动**（porcelain 第二列 M/D）的条目才有「还原」，点了要先确认 —— 未跟踪文件不提供还原（那等于删文件） |
+| 「安全切分支」 | 工作区有未提交改动时点分支名：git 的裸 switch 会拒绝（`Your local changes would be overwritten`）。面板确认一句就自动走 stash push -u → **switch** → stash pop：切换成功后改动原样恢复，**切换失败自动还给你**（仓库回到切换前）。与「安全拉取」同一套安全保证 |
+| stash 备份 | 「安全拉取」「安全切分支」自动藏起来的改动收在一个可展开的列表里：能看到内容、一键**恢复**（`git stash apply`，不删备份）与**删除**（不可逆，要确认）。弹回冲突时面板会列出要处理的冲突文件，收尾不必回终端 |
+| 提交详情 | 最近提交的**整行可点**：点开看这条提交的作者 / 日期 / 改动统计（`git show --stat --format=fuller`，宿主截断后回传），再点收起 —— 和「点改动看 diff」是同一套交互 |
+| 提交并推送 | 提交表单第二个按钮：提交成功后立刻推一次，省掉「提交完再点推送」的第二下；推送失败的提示与补齐逻辑与「推送」按钮完全一致 |
+| 补充上次（amend） | 提交表单里的勾选框：`git commit --amend`，适合「刚提交完发现漏了个文件」；提交成功会自动取消勾选 |
+| 变基拉取 | 同步区「变基」勾选框：勾上后「拉取」走 `git pull --rebase`（本地提交挪到远端提交之上，历史更直） |
+| 浅克隆 | 克隆表单里的勾选框：`git clone --depth 1`，只取最新一次提交（快、小；要完整历史就别勾） |
+| 分支改名 | 分支管理器里**当前分支**那一行的「改名」（`git branch -m`）；名字由用户输入，面板不猜 |
+| 复制远程地址 | 远程行上的「复制」：把这行显示的地址放进剪贴板（优先 Clipboard API，非安全上下文退回 `execCommand`），ssh 形式也能复制 |
+| 自动刷新 | 窗口重新获得焦点 / 标签页重新可见时**静默**读一次状态（不点亮「同步中…」、失败不刷结果栏）；有未提交改动时每 20 秒轻量轮询一次，编辑器 / 终端里产生的改动也会自己出现在面板上 |
+| 面板尺寸与折叠 | 左缘可以拖动改宽度（300–520px），宽度与折叠态都记在 `localStorage`，下次打开就是上次的样子 |
+| 渲染错误边界 | 面板渲染抛异常时不再静默消失：画一个可读的失败态 + 原因 + 「重试」，并把原因写进宿主日志 |
 | 帮助（?） | 头部「?」在**新标签页打开独立帮助文档**（同源路由 `GET /git-panel/help`）：面板操作方式 + 分组常用 git 命令；**每条命令点一下即复制到剪贴板**。文档是普通网页——原生滚动、Ctrl+F 查找、可打印、可收藏，适合开着边看边敲 |
 | 切换 / 刷新 | 换一个目录操作 / 重新读取状态 |
 | 跟随会话 | 手动切过目录后，一键回到当前会话的工作目录 |
@@ -230,7 +243,7 @@ dsh-git-panel/            # 插件包本体（link 安装指向这里）
 ├── package.json          # dsh.bundle.patch / dsh.client 声明
 ├── cordis.patch.yml      # bundle patch：把本插件插入 profile 配置树
 ├── lib/
-│   ├── index.js          # 插件入口：apply() + 对外导出（0.10 起只剩 182 行，其中 114 行是代码）
+│   ├── index.js          # 插件入口：apply() + 对外导出（0.10 起只剩一个入口加一张导出清单）
 │   ├── routes.js         # HTTP 路由 /git-panel/* + op 流水线
 │   ├── ops.js            # 操作注册表：每个操作的 argv / 超时 / 解析 / 补救 / 提示（唯一事实来源）
 │   ├── tools.js          # 13 个 git 模型工具（argv 全部复用 ops.js）
@@ -269,7 +282,7 @@ dsh-git-panel/            # 插件包本体（link 安装指向这里）
 - **失败可见**：非零退出被归一化成 `{ code, stdout, stderr }` 回传面板，而不是抛异常，
   面板永远能渲染出原因。
 - **统一操作日志**：面板操作、AI 工具调用、网络配置变更、客户端注册过程、内部错误
-  全部写进 `$DSH_HOME/git-panel.log`（JSONL，级别 `off/error/warn/info/debug` 可配），
+  全部写进启动目录下的 `git-panel.log`（JSONL，级别 `off/error/warn/info/debug` 可配），
   超过 `logMaxBytes` 自动轮转只留两份。命令参数经 `displayArgv` 打码后才落盘；写失败
   只记 console 不抛异常 —— 日志是观测工具，不是新的故障点。`GET /git-panel/log` 可
   直接读尾部。
@@ -323,6 +336,35 @@ dsh-git-panel/            # 插件包本体（link 安装指向这里）
   分组顶部还有「远端默认分支：…」提示行；本地没有可用指针时面板自动向服务器补问
   一次（`git ls-remote --symref`，只读、走同一套镜像/代理，失败静默降级）；分支名
   截断后悬停（tooltip）能看到完整 ref。
+- **失败分类按操作分开**（0.12）：`classifyPushFailure` 只回答「推送为什么失败」，
+  拿它去问 commit 或 checkout 只会得到 `none`，用户看到的就是一句 git 英文原文。
+  现在三类各自的分类器 + 中文下一步：HTTPS 认证失败（`Authentication failed` /
+  `could not read Username` → 指向 Personal Access Token 与 `credential.helper`，
+  与 SSH 的 `auth-failed` 分开）、提交身份没配置（`Please tell me who you are` →
+  给出两条确切的 `git config` 命令）、切换撞上脏工作区（指向面板的「安全切分支」）。
+  分类器挂在 `OPS` 注册表上（`spec.classify` / `spec.hint`），新增操作只要声明一次。
+- **工具与面板共享同一条执行通道**（0.12）：`executeWithAcceleration` 从 routes.js
+  下移到 ops.js，两侧都调它 —— 于是「镜像失败自动回退直连」对 AI 工具同样生效
+  （此前只有面板会回退）；`git_pull` / `git_push` 工具还挂上了与面板同一套
+  `recoverPull` / `recoverPush`（无上游自动补 `-u`、自动改按「远程 + 分支」拉），
+  并把加速说明、补救说明（`⇢` 前缀）一并写进工具输出，模型能看到刚才为什么重试。
+- **同源校验之外再加一次性令牌**（0.12）：`sameOrigin` 比的是客户端自己写的两个头，
+  能伪造请求头的进程照样能过。现在 `GET /git-panel/state` 与 `GET /git-panel/net`
+  各发放一枚随机令牌，`POST /op` 与 `POST /net` 必须带上（令牌是「最近 64 枚」的集合，
+  多标签页不会互相踢掉）；**没有发放过令牌时不校验**，直接 curl 端口的自动化脚本
+  与既有测试不受影响，而浏览器发起的跨站请求一定先经过 GET —— 它读不到响应体里的令牌。
+- **状态短缓存与按目录串行**（0.12）：`readState` 一次要跑 4 条 git 进程，而「操作完
+  立刻看结果」「回到窗口自动刷新」会让同一目录在几百毫秒内被读两遍 —— 800ms 内直接
+  复用上一次结果；操作路径不读缓存（执行完必须回一份真实状态，并把结果写回缓存）。
+  面板有 busy 锁，但 AI 工具与面板可以同时操作同一个仓库，于是宿主按**目录**用一个
+  promise 链把写操作排成队（不同目录互不影响）。
+- **日志落在工作区**（0.12）：默认写到 `process.cwd()/git-panel.log`（启动 dsh 时所在
+  的目录），而不是 `$DSH_HOME` —— 排查时 `tail -f git-panel.log` 不用先 cd；已在
+  `.gitignore` 里排除，不入库。`logFile` 配置仍然可以覆盖到任意路径。
+- **数据型操作有独立的时间预算**（0.12）：`diff` / `branches` / `compare` / `show` /
+  `stashList` 这类本地命令正常是毫秒级，原先也按 120 秒预算等 —— 真出故障要干等两分钟
+  才见到提示。现在它们走 20 秒的本地档，联网操作（clone / fetch / pull / push）仍是
+  10 分钟档。
 
 ## 0.10 / 0.10.1 的契约变更（升级须知）
 
@@ -341,6 +383,21 @@ dsh-git-panel/            # 插件包本体（link 安装指向这里）
 | `setRemote` 的查重目录 | 原始请求体里的 `dir` | 路由归一化后的目录 | 配置了 `defaultDir` 或传 `~/…` 时会误判成「远程不存在」→ `remote add` 撞上 `remote origin already exists` |
 | `state.notice`（0.10.1） | 目录不存在时报「未检测到 git」；非仓库时报 git 的英文原文 | 目录不存在 → `目录不存在或无法进入：…`；非仓库 → `当前目录还不是 Git 仓库`；裸仓库 → 单独一句 | 前者把路径写错说成没装 git；后者让客户端的中文去重分支变成死代码（中英各显示一句） |
 | `lib/git.js` 的导出（0.10.1） | — | 多出 `NOT_REPO_NOTICE` / `BARE_REPO_NOTICE` / `notRepoNotice` | 宿主与客户端共用的那句去重文案需要一个可断言的出处 |
+
+## 0.12 的契约变更（升级须知）
+
+| 位置 | 之前 | 现在 | 为什么 |
+| --- | --- | --- | --- |
+| `GET /git-panel/state` / `GET /git-panel/net` 响应 | 只有业务字段 | 多一个 `csrf` | 发放一次性会话令牌（客户端只读它，不参与渲染） |
+| `POST /git-panel/op` / `POST /git-panel/net` | 只校验 `Origin` | 发放过令牌后还要带对令牌 | 跨站请求读不到响应体，拿不到令牌 —— 见「安全边界」 |
+| 日志默认路径 | `$DSH_HOME/git-panel.log` | **启动目录**下的 `git-panel.log` | 日志就在工作区里，`tail -f` 不用先 cd；已在 `.gitignore` 排除 |
+| 数据型操作的超时 | 一律 120 秒 | `diff`/`branches`/`compare`/`show`/`stashList` 走 20 秒本地档 | 本地命令正常是毫秒级，出故障不该干等两分钟 |
+| `commit` / `checkout` 失败的 `reason` | 一律 `none`（用户看到 git 英文原文） | `identity-missing` / `nothing-to-commit` / `dirty-worktree` / `branch-missing` + 中文 `hint` | 这三类是新手最常撞的，必须给出下一步 |
+| `pull` | 固定裸 `git pull` | 面板的「变基」勾选后走 `--rebase`（工具侧本来就有 `rebase`） | 能力面对齐 |
+| 模型工具 `git_pull` / `git_push` | 失败就把 git 原文返回 | 与面板同一套补救（无上游自动补 `-u`、自动改按「远程 + 分支」拉）+ 镜像失败自动回退直连 + `⇢` 说明行 | 两侧共用 `executeWithAcceleration` 与 `recoverPull` / `recoverPush` |
+| `OPS` 注册表 | 17 个操作 | 新增 `add` / `unstageFile` / `restoreFile` / `show` / `stashList` / `stashApply` / `stashDrop` / `renameBranch`（另有 `stashSwitch` 走 `SPECIAL_OPS`） | 面板新增入口都只在一处声明 |
+| 日志尾读 | 每次读整个文件 | 从文件尾部回读（单次最多 4 MiB） | `GET /git-panel/log` 会被反复调用 |
+| 面板前端 | 渲染异常即静默消失 | 加了渲染错误边界：失败态 + 原因 + 「重试」，原因写进日志 | 与宿主「故障可见」的原则对齐（测试替身下自动降级为直通） |
 
 ## 依赖与兼容性（换机器 / 换 DSH 版本）
 
@@ -385,7 +442,7 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
     defaultDir: /home/me/project   # 缺省操作目录；留空 = 跟随当前会话工作目录
     logLevel: info                 # 日志级别：off | error | warn | info | debug
     logMaxBytes: 2097152           # 日志轮转上限，超出后旧文件改名 .1
-    logFile: ''                    # 日志文件路径；留空 = $DSH_HOME/git-panel.log
+    logFile: ''                    # 日志文件路径；留空 = 启动目录下的 git-panel.log
 ```
 
 网络加速（镜像 / 代理）**不走这里**，而是 `$DSH_HOME/git-panel-net.json`，由面板的
@@ -394,22 +451,29 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
 
 ## 安全边界（部署时注意）
 
-面板路由 `/git-panel/*` **没有独立鉴权**，执行类请求只校验 `Origin` 同源。
-因此：
+面板路由 `/git-panel/*` **没有独立鉴权**，执行类请求校验两样东西：
+`Origin` 同源，以及一枚**一次性会话令牌**（0.12 起）。
+
+令牌的作用是挡住「能伪造 `Origin` 的跨站请求」：`GET /git-panel/state` 与
+`GET /git-panel/net` 在响应体里各发一枚随机令牌（保留最近 64 枚，多标签页不会互相踢掉），
+`POST /op` 与 `POST /net` 必须带上其中一枚才执行。浏览器发起的跨站请求虽然能发出
+GET，却**读不到响应体**，因此拿不到令牌；带上假令牌一律 403。
+注意两点：令牌只在浏览器同源页面里流转、不落盘；**服务端从未发放过令牌时不校验**，
+这是为了不破坏 `curl` 之类的本地自动化（也正因如此，它不是「鉴权」，只是加固）。即便如此：
 
 - 绑定 `127.0.0.1` 时，能访问到的只有本机进程；
 - 若 `webserver.host` 配成 `0.0.0.0`（手机 / 局域网访问场景常见），同网段的主机
-  只要能在 HTTP 头里伪造 `Origin`，就能调用这些接口执行
-  `git clone / pull / push / commit` 等操作。
+  只要能在 HTTP 头里伪造 `Origin`、**且能从别处拿到一枚令牌**，就能调用这些接口执行
+  `git clone / pull / push / commit` 等操作。请把令牌理解为「把难度从伪造一个头
+  提高到需要先读到同源响应」，而不是「已经安全」。
 
 `/git-panel/net` 也在这个范围内，分两种情况：
 
 - `GET` 读配置、`GET ?probe=1` 现场探测各线路。**代理地址一律打码**后才返回
   （`http://***@host:7890`），明文凭据不回显、不进浏览器；但「设过代理」这个事实、
   以及探测各线路通不通的结果，局域网内是可见的。
-- `POST` 保存配置**带同源校验**，因为该接口决定 git 命令**怎么执行** —— 被跨站
-  改写就等于把仓库流量导向别处。这里的 `Origin` 校验和上面一样，是可伪造的，
-  别把它当鉴权。
+- `POST` 保存配置**带同源校验 + 令牌校验**，因为该接口决定 git 命令**怎么执行** ——
+  被跨站改写就等于把仓库流量导向别处。
 
 `GET /git-panel/log` 是**只读**的日志尾读接口，无同源校验。日志本身已经是保守视角：
 命令参数打码、凭据不落盘；但它包含操作目录、仓库名与提交信息等**本机工作痕迹**，
@@ -519,12 +583,15 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
 
 ## 日志（维护排查用）
 
-插件在 `$DSH_HOME` 下维护一份统一的操作日志：
+插件在本机上维护一份统一的操作日志，**默认就写在启动 dsh 时所在的工作区目录**：
 
 ```
-~/.dsh/git-panel.log       # JSONL：一行一条 { at, level, event, … }
-~/.dsh/git-panel.log.1     # 超过轮转上限后的旧文件（只保留这一份备份）
+<启动 dsh 时的目录>/git-panel.log     # JSONL：一行一条 { at, level, event, … }
+<启动 dsh 时的目录>/git-panel.log.1   # 超过轮转上限后的旧文件（只保留这一份备份）
 ```
+
+`git-panel.log` 已在 `.gitignore` 里排除（`/git-panel.log*`），不会被提交；想放到别处
+就用行配置 `logFile` 覆盖（见下）。
 
 **记什么**：面板每一次操作（op：操作名、目录、命令、退出码、耗时、失败原因、是否补救/
 走哪条网络线路）、AI 工具每一次调用（tool）、网络加速配置变更（net）、客户端界面
@@ -545,16 +612,16 @@ DSH 契约（`dsh.bundle.patch` / `dsh.client` / `exports["./client"]` / `ctx.we
 也可以在浏览器里直接开这个地址。命令行查看：
 
 ```bash
-tail -f ~/.dsh/git-panel.log          # 实时看
-tail -50 ~/.dsh/git-panel.log | jq    # 按字段解析（每行是一个 JSON 对象）
+tail -f git-panel.log                 # 实时看（日志默认就在启动 dsh 的目录里）
+tail -50 git-panel.log | jq           # 按字段解析（每行是一个 JSON 对象）
 ```
 
 **安全**：日志里的命令参数与网络加速配置**一律打码**（代理凭据 → `***@`，与面板回显
-同规则）；文件只落在本机 `$DSH_HOME`，可随时删除。**写日志失败不影响任何功能**。
+同规则）；文件只落在本机启动目录，可随时删除。**写日志失败不影响任何功能**。
 
 **配置**：在 profile 的 `cordis.patch.yml` 里用同一个 id 覆盖
 `logLevel` / `logMaxBytes`（默认 2 MiB，超过后轮转）/ `logFile`（默认
-`$DSH_HOME/git-panel.log`）。
+启动目录下的 `git-panel.log`）。
 
 ## 测试
 
@@ -563,7 +630,7 @@ tail -50 ~/.dsh/git-panel.log | jq    # 按字段解析（每行是一个 JSON �
 clone 目标名、远程地址 → 仓库主页推导、目录归一化），用 Node 自带测试框架覆盖：
 
 ```bash
-npm test        # node --test：154 个用例，秒级完成（假 git 的 3 道 POSIX 专属用例会跳过）
+npm test        # node --test：199 个用例，秒级完成（假 git / 真 git 的 POSIX 专属用例会自动跳过）
 npm run check   # 语法检查（lib/ 下全部模块 + 客户端 bundle）
 ```
 
@@ -580,10 +647,10 @@ npm run check   # 语法检查（lib/ 下全部模块 + 客户端 bundle）
 
 | 文件 | 验证什么 |
 | --- | --- |
-| `test/standalone.test.mjs` | 用 mock ctx 把宿主半边跑一遍：`import` 不抛异常；`apply()` 在「服务就绪 / 稍后就绪 / 都缺 / ctx 被裁剪」四种情况下都不抛；卸载能清空路由与工具；13 个工具的 `parameters` 都落在 harness 支持的 JSON Schema 子集内（用了 `anyOf` / `$ref` / `format` 之类会让 `tools.register` 抛错、工具静默全丢）；**工具的参数错误必须抛错**（不能返回文本被模型读成成功）；**面板与工具对切换/新建/删除分支生成同一份 argv**（回归：曾分叉成 switch vs checkout）；**`OPS.network` 与 `NETWORK_OPS` 完全一致**（加了新操作却忘了让加速生效会变成静默直连）；**`setRemote` 的查重与执行用同一个目录**（回归：曾用原始 `body.dir` 查重，`~/…` 或 `defaultDir` 下会误判成远程不存在）；**「不是工作区」的四种诊断互不冒充**（目录不存在 / 传进来的是文件 / 普通目录 / 裸仓库，并且断言 `client.js` 里去重用的就是宿主发出的那个字符串 —— 回归：宿主发 git 英文原文，客户端去重分支成了死代码） |
-| `test/unit.test.mjs` | 纯函数逐个断言：porcelain 分支行、`git remote -v`、推送/拉取的失败分类与中文提示、`git branch --remotes`（`origin/HEAD -> origin/main` 这类指针必须被排除）、`git ls-remote --symref` 的默认分支解析（哈希行/空输出一律 null，绝不瞎猜）、远端引用校验（`-x` / `a..b` / 含空白的一律拒绝）、`HEAD...<ref>` 的领先/落后、远端默认分支的挑法（拿不准就返回 null，绝不猜）、`unrelatedChoices` 必须带上真正的远端分支名、clone 目标名、**远程地址 → 仓库主页推导**（https / scp / git:// / ssh:// 都认，`.git` 去除；本地路径、盘符、`file://`、空地址一律 null）、目录归一化；日志模块：级别归一化与过滤、JSONL 落盘、轮转只留 `.1` 一份、尾部读取 |
-| `test/client.test.mjs` | 用假 window + 假 React 把客户端 bundle 求值一遍：bundle 格式与 id 正确；**只 require `react` 这一个种子模块**（多 require 别的就说明依赖了构建产物）；导出 `apply` + `inject: ['slots']`；`slots` 缺失 / 直接注册成功 / 稍后声明三种时机都不抛；注册失败会把真实原因回报；组件在 props 缺失时也能渲染（slot 契约变化不白屏）；点改动看 diff 能走到终态（用**有状态**的假 React 真重渲染，不会停在「加载中…」）；**切换工作区后命令结果栏 / diff / 状态都属于新工作区**（旧仓库的瞬时结果被清掉，切走之后才回来的操作结果被丢弃）；**「目录跟随会话」用的是真实形状的 `SessionListState`**（当前会话 = `retainedBy.mainView > 0` 的那一行，假 store 刻意没有 `current` 字段）：切到另一个会话要跟着换目录、没有当前会话时退回宿主缺省目录、手动切过目录后不被覆盖；网络加速设置块能展开、能保存、检测结果能列出，且网络失败时会自动展开；**「管理」里能看到远端分支**，点「拿成新分支」POST 的是带 `remote`/`branch` 的 `adoptRemote`（不是按当前分支名去猜），点远端分支不会触发 checkout；**默认分支有独立徽章、名字截断后悬停出完整 ref、分组顶部有「远端默认分支：…」提示行**（defaultRef 缺失时用宿主的 defaults，回归：默认标记曾写在名字字符串里、一截断就消失，tooltip 也不带 ref）；**宿主的 `notice` 会显示出来**（回归：宿主算了却没人读）；**改动被截断时会写明「还有 N 处未显示」**，胶囊用 `changesTotal` 而不是列表长度；**数据型操作带 `noState`，`state:null` 不会抹掉面板状态**；**远程地址能推导成网页地址时，「远程」行出现「仓库页 ↗」外链**（`<a target=_blank>` 纯跳转、不发任何 op；本地路径推导不出、或老宿主没回 `pageUrl` 字段时，绝不渲染死链）；**换工作区会收起分支管理器、清掉远程地址草稿**（reducer 的 `'reset-repo'`，回归：曾漏掉 `branchDraft`/`dirDraft`）；**数组子节点都必须带 key**（遍历假 React 元素树断言，回归：真实 React 会对 `GitPanel` 的 children 打 key 警告，而假 React 不检查） |
-| `test/network.test.mjs` | 网络加速整条链路：配置归一化（含「只打开开关就该生效」这个踩过的坑）、`insteadOf` 的 base 拼法、push 不走镜像、`noMirror` 回退参数、凭据打码（GET 视图 / 命令回显 / 工具输出三处都不能漏）、失败分类（用户那条真实报错要认出来，404 不能被当成网络问题）、配置落盘与合并、`/git-panel/net` 三种方法 + 跨站拒绝 + 打码串回传语义；最后用**假 git 放到 PATH 最前面**离线复现「镜像挂、直连通」，验证自动回退确实发生、且结果栏会说明这件事；`/git-panel/log` 路由返回最近日志行 |
+| `test/standalone.test.mjs` | 用 mock ctx 把宿主半边跑一遍：`import` 不抛异常；`apply()` 在「服务就绪 / 稍后就绪 / 都缺 / ctx 被裁剪」四种情况下都不抛；卸载能清空路由与工具；13 个工具的 `parameters` 都落在 harness 支持的 JSON Schema 子集内（用了 `anyOf` / `$ref` / `format` 之类会让 `tools.register` 抛错、工具静默全丢）；**工具的参数错误必须抛错**（不能返回文本被模型读成成功）；**面板与工具对切换/新建/删除分支生成同一份 argv**（回归：曾分叉成 switch vs checkout）；**`OPS.network` 与 `NETWORK_OPS` 完全一致**（加了新操作却忘了让加速生效会变成静默直连）；**`setRemote` 的查重与执行用同一个目录**（回归：曾用原始 `body.dir` 查重，`~/…` 或 `defaultDir` 下会误判成远程不存在）；**「不是工作区」的四种诊断互不冒充**（目录不存在 / 传进来的是文件 / 普通目录 / 裸仓库，并且断言 `client.js` 里去重用的就是宿主发出的那个字符串 —— 回归：宿主发 git 英文原文，客户端去重分支成了死代码）；**`stashSwitch`（安全切分支）在真 git 里跑三遍**：有改动时藏起→切换→恢复且一件不少、目标分支不存在时改动原样还回工作区、干净工作区不制造 stash；**`runPanelOp` 真跑一遍新增的数据型操作**（`show` / `stashList` / 单文件暂存与取消暂存），断言解析出来的字段（回归：只断言 argv 发现不了「解析函数没挂上、面板永远读不到 show/stash」） |
+| `test/unit.test.mjs` | 纯函数逐个断言：porcelain 分支行、`git remote -v`、推送/拉取的失败分类与中文提示、`git branch --remotes`（`origin/HEAD -> origin/main` 这类指针必须被排除）、`git ls-remote --symref` 的默认分支解析（哈希行/空输出一律 null，绝不瞎猜）、远端引用校验（`-x` / `a..b` / 含空白的一律拒绝）、`HEAD...<ref>` 的领先/落后、远端默认分支的挑法（拿不准就返回 null，绝不猜）、`unrelatedChoices` 必须带上真正的远端分支名、clone 目标名、**远程地址 → 仓库主页推导**（https / scp / git:// / ssh:// 都认，`.git` 去除；本地路径、盘符、`file://`、空地址一律 null）、目录归一化；日志模块：级别归一化与过滤、JSONL 落盘、轮转只留 `.1` 一份、尾部读取、默认路径落在启动目录；**新增的三类失败分类与提示**（HTTPS 认证 → 令牌与 `credential.helper`、提交身份没配置 → 两条 `git config` 命令、切换撞脏工作区 → 指向「安全切分支」）、`stash@{n}` 编号解析与校验、新操作的 argv（单文件暂存/还原带 `--`、`show` 带 `--stat`、pull 的 rebase、commit 的 amend）、**数据型操作的 20 秒超时档** |
+| `test/client.test.mjs` | 用假 window + 假 React 把客户端 bundle 求值一遍：bundle 格式与 id 正确；**只 require `react` 这一个种子模块**（多 require 别的就说明依赖了构建产物）；导出 `apply` + `inject: ['slots']`；`slots` 缺失 / 直接注册成功 / 稍后声明三种时机都不抛；注册失败会把真实原因回报；组件在 props 缺失时也能渲染（slot 契约变化不白屏）；点改动看 diff 能走到终态（用**有状态**的假 React 真重渲染，不会停在「加载中…」）；**切换工作区后命令结果栏 / diff / 状态都属于新工作区**（旧仓库的瞬时结果被清掉，切走之后才回来的操作结果被丢弃）；**「目录跟随会话」用的是真实形状的 `SessionListState`**（当前会话 = `retainedBy.mainView > 0` 的那一行，假 store 刻意没有 `current` 字段）：切到另一个会话要跟着换目录、没有当前会话时退回宿主缺省目录、手动切过目录后不被覆盖；网络加速设置块能展开、能保存、检测结果能列出，且网络失败时会自动展开；**「管理」里能看到远端分支**，点「拿成新分支」POST 的是带 `remote`/`branch` 的 `adoptRemote`（不是按当前分支名去猜），点远端分支不会触发 checkout；**默认分支有独立徽章、名字截断后悬停出完整 ref、分组顶部有「远端默认分支：…」提示行**（defaultRef 缺失时用宿主的 defaults，回归：默认标记曾写在名字字符串里、一截断就消失，tooltip 也不带 ref）；**宿主的 `notice` 会显示出来**（回归：宿主算了却没人读）；**改动被截断时会写明「还有 N 处未显示」**，胶囊用 `changesTotal` 而不是列表长度；**数据型操作带 `noState`，`state:null` 不会抹掉面板状态**；**远程地址能推导成网页地址时，「远程」行出现「仓库页 ↗」外链**（`<a target=_blank>` 纯跳转、不发任何 op；本地路径推导不出、或老宿主没回 `pageUrl` 字段时，绝不渲染死链）；**换工作区会收起分支管理器、清掉远程地址草稿**（reducer 的 `'reset-repo'`，回归：曾漏掉 `branchDraft`/`dirDraft`）；**数组子节点都必须带 key**（遍历假 React 元素树断言，回归：真实 React 会对 `GitPanel` 的 children 打 key 警告，而假 React 不检查）；**新增交互都要把正确的 op 与参数交给宿主**：单文件「暂存 / 取消暂存 / 还原」（还原只出现在工作区确有改动的行上、且要确认）、点最近提交发 `show` 并渲染详情、stash 备份展开/恢复/删除（删除要确认、`ref` 原样回传）、脏工作区点分支名改发 `stashSwitch`（不再发会被 git 拒绝的裸 `checkout`）、「提交并推送」是提交成功后两步且 amend 要带进请求、变基与浅克隆两个开关进对应请求、宽度与折叠态从 localStorage 恢复（越界回退默认值）、窗口 focus 触发**静默**刷新（不点亮「同步中…」）|
+| `test/network.test.mjs` | 网络加速整条链路：配置归一化（含「只打开开关就该生效」这个踩过的坑）、`insteadOf` 的 base 拼法、push 不走镜像、`noMirror` 回退参数、凭据打码（GET 视图 / 命令回显 / 工具输出三处都不能漏）、失败分类（用户那条真实报错要认出来，404 不能被当成网络问题）、配置落盘与合并、`/git-panel/net` 三种方法 + 跨站拒绝 + 打码串回传语义；最后用**假 git 放到 PATH 最前面**离线复现「镜像挂、直连通」，验证自动回退确实发生、且结果栏会说明这件事；`/git-panel/log` 路由返回最近日志行；**会话令牌**：GET 发放、没带/带错令牌的 POST 一律 403、带对才放行；**直连探测显式清掉全局代理**（`-c http.proxy=`） |
 
 > 这几个文件是**换机器、换 DSH 版本时的第一道回归**：`npm test` 过了，说明插件
 > 自身的加载与注册契约没变；剩下的只是 DSH 侧服务是否提供（缺了就优雅降级）。
@@ -599,7 +666,7 @@ npm run check   # 语法检查（lib/ 下全部模块 + 客户端 bundle）
 | --- | --- | --- |
 | 真 git 端到端 | 直接调路由 handler / `tools.register` 注册出来的 `execute`，在**临时仓库**里跑真实 git（`git init` → 提交 → 分支 → 推送 → 克隆 → 拉取） | `runGit` 真的能不能执行（0.10 拆分时 `execFileAsync` 被漏掉、`runGit` 每次返回 `code:-1`，143 个用例仍全绿 —— 因为能覆盖它的用例在受限沙箱里被跳过了）；注入的 `-c` 参数 git 认不认；真实 porcelain 输出与解析器是否对得上 |
 | 真 React 渲染 | 用 DSH 自带的那份 React + jsdom 把客户端 bundle 真渲染一遍 | 假 React 检查不出来的东西：list 的 `key` 警告、`useSyncExternalStore` 订阅是否真的会触发重渲染 |
-| 运行中的宿主 HTTP 冒烟 | 对**已经在跑的** dsh 打真实请求（`/git-panel/state`、`/op`、`/net`、`/log`、`/help`，含 400/403/405 与危险参数被挡在 git 之外），并在 `$DSH_HOME/git-panel.log` 里核对留痕 | 「磁盘上是新代码、进程里跑的是旧代码」这件事本身；只有真实进程才有的响应形状（0.10.1 的两个文案缺陷就是这样发现的：敲错目录被报成「未检测到 git」、非仓库显示 git 英文原文） |
+| 运行中的宿主 HTTP 冒烟 | 对**已经在跑的** dsh 打真实请求（`/git-panel/state`、`/op`、`/net`、`/log`、`/help`，含 400/403/405 与危险参数被挡在 git 之外），并在启动目录的 `git-panel.log` 里核对留痕 | 「磁盘上是新代码、进程里跑的是旧代码」这件事本身；只有真实进程才有的响应形状（0.10.1 的两个文案缺陷就是这样发现的：敲错目录被报成「未检测到 git」、非仓库显示 git 英文原文） |
 
 > 宿主半边**不会**热重载：改了 `lib/*.js` 要重启 dsh 才生效（客户端半边会随页面重载）。
 > 重启前刷新页面会拿新客户端配旧宿主，`branches` 这类契约变更期间会看到空列表 ——

@@ -701,6 +701,16 @@ function findButton(tree, label) {
   return flattenTree(tree).find((node) => node.type === 'button' && textOf(node) === label)
 }
 
+/** 按包裹它的 label 文本找一个勾选框（面板里有 amend / 变基 / 浅克隆几个）。 */
+function findCheckbox(tree, labelText) {
+  const label = flattenTree(tree).find((node) =>
+    node !== null && typeof node === 'object' && node.type === 'label'
+    && textOf(node).includes(labelText))
+  if (label === undefined) return undefined
+  return (label.children ?? []).find((child) =>
+    child !== null && typeof child === 'object' && child.type === 'input')
+}
+
 const WS_A = {
   ok: true, dir: '/tmp/ws-a', isRepo: true, branch: 'main', upstream: null,
   ahead: 0, behind: 0, changes: [{ code: ' M', path: 'a.txt', staged: false }],
@@ -1595,3 +1605,348 @@ test('client standalone：推导不出网页地址（本地路径 / 老宿主没
   assert.equal(legacyLinks.length, 0, '没回 pageUrl 时宁可没有入口，不能给出死链')
 })
 
+
+// ── 8. 新增交互：单文件操作 / 提交详情 / stash 备份 / 安全切分支 / 提交并推送 ──
+//
+// 这一批的共同点：**每个动作都要把正确的 op 与参数交给宿主**。面板本身不执行 git，
+// 参数写错（少 path、少 branch、漏 amend）在界面上完全看不出来 —— 只有断言
+// POST 出去的那份 JSON 才能钉住。
+
+/** 收集本次测试里发往 /git-panel/op 的请求体。 */
+function opPayloads(harness) {
+  return harness.calls.fetch
+    .filter((call) => String(call.url).includes('/git-panel/op'))
+    .map((call) => JSON.parse(call.init.body))
+}
+
+const REPO_WITH_CHANGES = {
+  ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: 'origin/main',
+  ahead: 0, behind: 0,
+  changes: [
+    { code: ' M', path: 'f.txt', staged: false },
+    { code: 'M ', path: 'g.txt', staged: true },
+  ],
+  changesTotal: 2,
+  log: [{ hash: 'abc1234', subject: '第一次提交' }],
+  remotes: [{ name: 'origin', url: 'https://github.com/user/demo.git' }],
+  pageUrl: 'https://github.com/user/demo',
+}
+
+test('client standalone：改动行有单文件「暂存 / 取消暂存」按钮，点击把路径交给宿主', async () => {
+  const harness = makeFakeWindow({ stateResponse: REPO_WITH_CHANGES })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+
+  // 未暂存的那条给「暂存」，已暂存的那条给「取消暂存」。
+  const stage = findButton(tree, '暂存')
+  assert.ok(stage !== undefined, '未暂存的改动旁边要有「暂存」按钮')
+  await stage.props.onClick({ stopPropagation: () => {} })
+  await react.settle()
+  const add = opPayloads(harness).find((payload) => payload.op === 'add')
+  assert.ok(add !== undefined, '点「暂存」应该 POST op=add')
+  assert.equal(add.path, 'f.txt', '要把这一行的文件路径交给宿主（再点一次别的行不能串味）')
+
+  const unstage = findButton(tree, '取消暂存')
+  assert.ok(unstage !== undefined, '已暂存的改动旁边要有「取消暂存」按钮')
+  await unstage.props.onClick({ stopPropagation: () => {} })
+  await react.settle()
+  const restoreStaged = opPayloads(harness).find((payload) => payload.op === 'unstageFile')
+  assert.ok(restoreStaged !== undefined, '点「取消暂存」应该 POST op=unstageFile')
+  assert.equal(restoreStaged.path, 'g.txt')
+})
+
+test('client standalone：「还原」只出现在工作区确实有改动的条目上，且要确认', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: Object.assign({}, REPO_WITH_CHANGES, {
+      // 三条：工作区修改（可还原）、纯暂存（没有可还原的工作区内容）、未跟踪（还原=删文件）。
+      changes: [
+        { code: ' M', path: 'a.txt', staged: false },
+        { code: 'M ', path: 'b.txt', staged: true },
+        { code: '??', path: 'c.txt', staged: false },
+      ],
+      changesTotal: 3,
+    }),
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+
+  const restoreButtons = flattenTree(tree).filter((node) => node.type === 'button' && textOf(node) === '还原')
+  assert.equal(restoreButtons.length, 1, '只有「工作区有改动」的那一行该有还原：' + restoreButtons.length)
+
+  await restoreButtons[0].props.onClick({ stopPropagation: () => {} })
+  await react.settle()
+  const payload = opPayloads(harness).find((item) => item.op === 'restoreFile')
+  assert.ok(payload !== undefined, '确认后应 POST op=restoreFile')
+  assert.equal(payload.path, 'a.txt')
+})
+
+test('client standalone：点最近提交的一行，把提交号交给宿主并渲染详情', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    opResponses: {
+      show: {
+        ok: true, show: 'commit abc1234\nAuthor: 张三 <z@example.com>\n\n    第一次提交\n f.txt | 2 +-',
+        state: null,
+      },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+
+  const row = flattenTree(initial).find((node) =>
+    node !== null && typeof node === 'object' && node.props !== undefined
+    && typeof node.props.onClick === 'function' && textOf(node) === 'abc1234第一次提交')
+  assert.ok(row !== undefined, '提交行本身要可点（整行是一个动作）')
+  await row.props.onClick()
+  const after = await react.settle()
+
+  const show = opPayloads(harness).find((payload) => payload.op === 'show')
+  assert.ok(show !== undefined, '点提交行应 POST op=show')
+  assert.equal(show.ref, 'abc1234')
+  assert.equal(show.noState, true, '数据型操作不该让宿主回读仓库状态')
+  assert.ok(textOf(after).includes('Author: 张三'), '详情要渲染在面板里：' + textOf(after).slice(-200))
+
+  // 再点一次收起（同一个 hash）。
+  const rowAgain = flattenTree(after).find((node) =>
+    node !== null && typeof node === 'object' && node.props !== undefined
+    && typeof node.props.onClick === 'function' && textOf(node) === 'abc1234第一次提交')
+  await rowAgain.props.onClick()
+  const closed = await react.settle()
+  assert.ok(!textOf(closed).includes('Author: 张三'), '再点同一行应收起详情')
+})
+
+test('client standalone：stash 备份能展开、恢复、删除（删除要确认）', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    opResponses: {
+      stashList: {
+        ok: true,
+        stash: [{ ref: 'stash@{0}', text: 'WIP on main: 拉取前暂存（自动）' }],
+        state: null,
+      },
+      stashDrop: { ok: true, state: REPO_WITH_CHANGES },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+
+  const toggle = findButton(initial, 'stash 备份')
+  assert.ok(toggle !== undefined, '应有「stash 备份」入口')
+  await toggle.props.onClick()
+  const opened = await react.settle()
+
+  const list = opPayloads(harness).find((payload) => payload.op === 'stashList')
+  assert.ok(list !== undefined, '展开时应查一次 stashList')
+  assert.equal(list.noState, true)
+  assert.ok(textOf(opened).includes('WIP on main'), '备份内容要列出来：' + textOf(opened).slice(-200))
+
+  const drop = findButton(opened, '删除')
+  assert.ok(drop !== undefined, '每份备份旁边要有「删除」')
+  await drop.props.onClick()
+  await react.settle()
+  const dropped = opPayloads(harness).find((payload) => payload.op === 'stashDrop')
+  assert.ok(dropped !== undefined, '确认后应 POST op=stashDrop')
+  assert.equal(dropped.ref, 'stash@{0}', 'ref 必须原样交给宿主（它是 git 的参数）')
+})
+
+test('client standalone：脏工作区点分支名 → 确认后用「安全切分支」而不是裸 checkout', async () => {
+  const repoState = Object.assign({}, REPO_WITH_CHANGES, {
+    changes: [{ code: ' M', path: 'f.txt', staged: false }],
+    changesTotal: 1,
+  })
+  const harness = makeFakeWindow({
+    stateResponse: repoState,
+    opResponses: {
+      branches: {
+        ok: true,
+        branches: { current: 'main', items: [{ name: 'main', current: true }, { name: 'dev', current: false }] },
+        remoteBranches: { defaultRef: null, items: [] },
+        state: null,
+      },
+      stashSwitch: { ok: true, state: repoState },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+
+  const manage = findButton(initial, '管理')
+  await manage.props.onClick()
+  const opened = await react.settle()
+
+  const devName = flattenTree(opened).find((node) =>
+    node !== null && typeof node === 'object' && node.type === 'span'
+    && typeof node.props.onClick === 'function' && textOf(node) === 'dev')
+  assert.ok(devName !== undefined, '本地分支名本身应可点（用来切换）')
+  await devName.props.onClick()
+  await react.settle()
+
+  const payloads = opPayloads(harness)
+  assert.ok(
+    payloads.some((payload) => payload.op === 'stashSwitch' && payload.branch === 'dev'),
+    '脏工作区下应走「安全切分支」并把分支名带上：' + JSON.stringify(payloads.filter((p) => p.op !== 'branches')),
+  )
+  assert.ok(!payloads.some((payload) => payload.op === 'checkout'),
+    '不应该再发一条会被 git 拒绝的裸 checkout')
+})
+
+test('client standalone：「提交并推送」是提交成功后的两步，amend 勾选要带进请求', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    opResponses: {
+      commit: { ok: true, command: 'git commit -m x', exitCode: 0, stdout: '', stderr: '', state: REPO_WITH_CHANGES },
+      push: { ok: true, command: 'git push', exitCode: 0, stdout: '', stderr: '', state: REPO_WITH_CHANGES },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+
+  // 填写提交信息并勾上「补充上次」。
+  const input = flattenTree(initial).find((node) =>
+    node.type === 'input' && node.props.placeholder === '填写提交信息…（回车直接提交）')
+  assert.ok(input !== undefined, '应有提交信息输入框')
+  await input.props.onChange({ target: { value: '修一处笔误' } })
+  const amended = await react.settle()
+  const amendBox = findCheckbox(amended, '补充上次')
+  assert.ok(amendBox !== undefined, '应有「补充上次」勾选框')
+  await amendBox.props.onChange({ target: { checked: true } })
+  const checked = await react.settle()
+
+  const commitAndPush = findButton(checked, '提交并推送')
+  assert.ok(commitAndPush !== undefined, '应有「提交并推送」按钮')
+  await commitAndPush.props.onClick()
+  await react.settle()
+
+  const payloads = opPayloads(harness)
+  const commit = payloads.find((payload) => payload.op === 'commit')
+  assert.ok(commit !== undefined, '应该先提交')
+  assert.equal(commit.message, '修一处笔误')
+  assert.equal(commit.amend, true, '勾了「补充上次」就要带 amend')
+  assert.ok(payloads.some((payload) => payload.op === 'push'), '提交成功后要接着推送')
+  assert.ok(amendBox !== undefined)
+})
+
+test('client standalone：变基 / 浅克隆两个开关都要带进对应请求', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    opResponses: {
+      pull: { ok: true, state: REPO_WITH_CHANGES },
+      clone: { ok: true, clonedDir: '/tmp/ws/new', state: REPO_WITH_CHANGES },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+
+  const rebaseBox = findCheckbox(initial, '变基')
+  assert.ok(rebaseBox !== undefined, '同步区应有「变基」勾选框')
+  await rebaseBox.props.onChange({ target: { checked: true } })
+  const rebased = await react.settle()
+  await findButton(rebased, '拉取').props.onClick()
+  await react.settle()
+  const pull = opPayloads(harness).find((payload) => payload.op === 'pull')
+  assert.equal(pull.rebase, true, '勾了变基，拉取要带 rebase')
+
+  // 非仓库状态才有克隆表单 —— 换一个假窗口单独验浅克隆。
+  const cloneHarness = makeFakeWindow({
+    stateResponse: { ok: true, dir: '/tmp/empty', isRepo: false, notice: '当前目录还不是 Git 仓库' },
+    opResponses: { clone: { ok: true, clonedDir: '/tmp/empty/repo', state: null } },
+  })
+  const cloneReact = makeStatefulReact()
+  const cloneBundle = evaluateBundle(cloneHarness, cloneReact.api)
+  mountPanel(cloneBundle.exports, cloneReact, sessionStore({ s1: { cwd: '/tmp/empty' } }))
+  const emptyTree = await cloneReact.settle()
+  await findButton(emptyTree, '克隆仓库').props.onClick()
+  const withForm = await cloneReact.settle()
+  const shallowBox = findCheckbox(withForm, '浅克隆')
+  assert.ok(shallowBox !== undefined, '克隆表单应有「浅克隆」勾选框')
+  await shallowBox.props.onChange({ target: { checked: true } })
+  const shallow = await cloneReact.settle()
+  const urlInput = flattenTree(shallow).find((node) =>
+    node.type === 'input' && String(node.props.placeholder).includes('仓库地址'))
+  await urlInput.props.onChange({ target: { value: 'https://github.com/user/demo.git' } })
+  const filled = await cloneReact.settle()
+  await findButton(filled, '开始克隆').props.onClick()
+  await cloneReact.settle()
+  const clone = opPayloads(cloneHarness).find((payload) => payload.op === 'clone')
+  assert.equal(clone.depth, 1, '勾了浅克隆要带 depth')
+  assert.equal(clone.url, 'https://github.com/user/demo.git')
+})
+
+test('client standalone：面板宽度与折叠态会被记住（localStorage）', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    prefillStorage: { 'dsh-git-panel-width': '420' },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+
+  const shell = flattenTree(tree).find((node) =>
+    node !== null && typeof node === 'object' && node.props !== undefined
+    && node.props.className === 'dgp-panel')
+  assert.ok(shell !== undefined, '应渲染出面板外壳')
+  assert.equal(shell.props.style.width, '420px', '上次调好的宽度应该被记住')
+
+  // 越界的宽度要被拒绝，回到默认 360px。
+  const brokenHarness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    prefillStorage: { 'dsh-git-panel-width': '99999' },
+  })
+  const brokenReact = makeStatefulReact()
+  const brokenBundle = evaluateBundle(brokenHarness, brokenReact.api)
+  mountPanel(brokenBundle.exports, brokenReact, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const brokenTree = await brokenReact.settle()
+  const brokenShell = flattenTree(brokenTree).find((node) =>
+    node !== null && typeof node === 'object' && node.props !== undefined
+    && node.props.className === 'dgp-panel')
+  assert.equal(brokenShell.props.style.width, '360px', '越界宽度要退回默认值')
+  assert.ok(
+    flattenTree(brokenTree).some((node) => node.props !== undefined && node.props.className === 'dgp-resize'),
+    '面板左缘应有拖拽条',
+  )
+
+  // 上次是收起的 → 这次直接渲染成胶囊，而不是先闪一下完整面板。
+  const minHarness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    prefillStorage: { 'dsh-git-panel-min': '1' },
+  })
+  const minReact = makeStatefulReact()
+  const minBundle = evaluateBundle(minHarness, minReact.api)
+  mountPanel(minBundle.exports, minReact, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const minTree = await minReact.settle()
+  assert.ok(
+    flattenTree(minTree).some((node) => node.props !== undefined && node.props.className === 'dgp-pill'),
+    '记住的折叠态要生效（渲染成胶囊）',
+  )
+})
+
+test('client standalone：窗口重新获得焦点时静默刷新一次状态（不点亮「同步中…」）', async () => {
+  const harness = makeFakeWindow({ stateResponse: REPO_WITH_CHANGES })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  await react.settle()
+
+  const focus = harness.listeners.get('focus')
+  assert.equal(typeof focus, 'function', '应注册窗口 focus 监听（回到浏览器时自动刷新）')
+  const before = harness.calls.fetch.filter((call) => String(call.url).includes('/git-panel/state')).length
+  focus()
+  const after = await react.settle()
+  const stateCalls = harness.calls.fetch.filter((call) => String(call.url).includes('/git-panel/state')).length
+  assert.equal(stateCalls, before + 1, '获得焦点应重新读一次状态')
+  assert.ok(!textOf(after).includes('同步中…'), '后台刷新不该点亮「同步中…」打扰用户')
+})
