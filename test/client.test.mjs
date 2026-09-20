@@ -1411,3 +1411,68 @@ test('client standalone：换工作区会收起分支管理器并清掉远程地
   )
 })
 
+// ── 9. 打开仓库主页：远程地址能推导出网页地址时给出「仓库页 ↗」入口 ──────────
+
+test('client standalone：有 pageUrl 时远程行出现「仓库页 ↗」外链（新标签页，不经过宿主）', async () => {
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: 'origin/main',
+    ahead: 0, behind: 0, changes: [], log: [],
+    remotes: [{ name: 'origin', url: 'git@github.com:user/demo.git' }],
+    // 宿主由远程地址推导出来（scp 风格 → https 页面地址）。
+    pageUrl: 'https://github.com/user/demo',
+  }
+  const harness = makeFakeWindow({ stateResponse: repoState })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+
+  const link = flattenTree(tree).find((node) =>
+    node !== null && typeof node === 'object' && node.type === 'a' && node.props.href === 'https://github.com/user/demo')
+  assert.ok(link !== undefined, '远程行应渲染出仓库主页链接')
+  assert.equal(link.props.target, '_blank', '要新标签页打开')
+  assert.equal(link.props.rel, 'noopener noreferrer', '新标签页链接要带 rel=noopener')
+  assert.ok(textOf(link).includes('仓库页'), '链接要自带「仓库页」字样，用户才知道它是干嘛的')
+  assert.ok(
+    String(link.props.title).includes('https://github.com/user/demo'),
+    '链接标题要带真实地址：' + String(link.props.title),
+  )
+  // 它是 <a> 不是 <button>：跳转交给浏览器（支持中键/复制地址），不发任何 op。
+  assert.equal(link.props.onClick, undefined, '外链不该有 onClick')
+  const opCalls = harness.calls.fetch.filter((call) => String(call.url).includes('/git-panel/op'))
+  assert.equal(opCalls.length, 0, '打开仓库页是纯跳转，不产生任何 git 操作')
+})
+
+test('client standalone：推导不出网页地址（本地路径 / 老宿主没回 pageUrl）时不显示死链', async () => {
+  const repoState = {
+    ok: true, dir: '/tmp/demo', isRepo: true, branch: 'main', upstream: 'origin/main',
+    ahead: 0, behind: 0, changes: [], log: [],
+    remotes: [{ name: 'origin', url: '/srv/local-mirror.git' }],
+    // 地址是本地路径，宿主推导不出网页地址 → pageUrl 为 null；老版本宿主干脆没这个字段。
+    pageUrl: null,
+  }
+  const harness = makeFakeWindow({ stateResponse: repoState })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+
+  const links = flattenTree(tree).filter((node) =>
+    node !== null && typeof node === 'object' && node.type === 'a'
+    && typeof node.props.href === 'string' && node.props.href.startsWith('http'))
+  assert.equal(links.length, 0, '本地路径远程不该出现仓库页链接：' + JSON.stringify(links.map((node) => node.props.href)))
+
+  // 老宿主：state 里根本没有 pageUrl 字段（例如宿主还是旧版本、客户端已热重载）。
+  const legacyState = Object.assign({}, repoState, { remotes: [{ name: 'origin', url: 'https://github.com/user/demo.git' }] })
+  delete legacyState.pageUrl
+  const legacyHarness = makeFakeWindow({ stateResponse: legacyState })
+  const legacyReact = makeStatefulReact()
+  const legacyBundle = evaluateBundle(legacyHarness, legacyReact.api)
+  mountPanel(legacyBundle.exports, legacyReact, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const legacyTree = await legacyReact.settle()
+  const legacyLinks = flattenTree(legacyTree).filter((node) =>
+    node !== null && typeof node === 'object' && node.type === 'a'
+    && typeof node.props.href === 'string' && node.props.href.startsWith('http'))
+  assert.equal(legacyLinks.length, 0, '没回 pageUrl 时宁可没有入口，不能给出死链')
+})
+

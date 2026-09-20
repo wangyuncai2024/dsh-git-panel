@@ -17,6 +17,7 @@ import {
   pushHint,
   remoteOpFor,
   cloneTargetName,
+  repoPageUrl,
   normalizeDir,
   parseBranchOutput,
   parseRemoteBranchOutput,
@@ -178,6 +179,47 @@ test('cloneTargetName：无路径分隔的输入原样返回（git 对本地路�
 test('cloneTargetName：空输入退化为占位名', () => {
   assert.equal(cloneTargetName(''), 'repository')
   assert.equal(cloneTargetName(null), 'repository')
+})
+
+// ── repoPageUrl：远程地址 → 仓库主页（面板「仓库页 ↗」入口） ────────────────
+
+test('repoPageUrl：https + .git 后缀 → 去后缀', () => {
+  assert.equal(repoPageUrl('https://github.com/user/my-repo.git'), 'https://github.com/user/my-repo')
+})
+
+test('repoPageUrl：https 无 .git、尾部斜杠、大写 .GIT', () => {
+  assert.equal(repoPageUrl('https://github.com/user/my-repo'), 'https://github.com/user/my-repo')
+  assert.equal(repoPageUrl('https://github.com/user/my-repo/'), 'https://github.com/user/my-repo')
+  assert.equal(repoPageUrl('https://github.com/user/my-repo.GIT/'), 'https://github.com/user/my-repo')
+})
+
+test('repoPageUrl：scp 风格 ssh 地址（git@host:path）', () => {
+  assert.equal(repoPageUrl('git@github.com:user/my-repo.git'), 'https://github.com/user/my-repo')
+})
+
+test('repoPageUrl：git:// 与 ssh:// 协议', () => {
+  assert.equal(repoPageUrl('git://github.com/user/my-repo.git'), 'https://github.com/user/my-repo')
+  assert.equal(repoPageUrl('ssh://git@github.com/user/my-repo.git'), 'https://github.com/user/my-repo')
+})
+
+test('repoPageUrl：非 GitHub 主机同样可打开（GitLab / Gitee）', () => {
+  assert.equal(repoPageUrl('https://gitlab.com/group/proj.git'), 'https://gitlab.com/group/proj')
+  assert.equal(repoPageUrl('git@gitee.com:user/proj.git'), 'https://gitee.com/user/proj')
+})
+
+test('repoPageUrl：带端口的主机保留端口', () => {
+  assert.equal(repoPageUrl('https://example.com:8443/a.git'), 'https://example.com:8443/a')
+})
+
+test('repoPageUrl：推导不出来的一律 null（本地路径 / 盘符 / file / 空 / 无路径）', () => {
+  assert.equal(repoPageUrl('/home/me/repo'), null)
+  assert.equal(repoPageUrl('C:\\work\\win-repo'), null)
+  assert.equal(repoPageUrl('file:///home/me/repo'), null)
+  assert.equal(repoPageUrl('not a url at all'), null)
+  assert.equal(repoPageUrl(''), null)
+  assert.equal(repoPageUrl(null), null)
+  assert.equal(repoPageUrl('https://github.com'), null)
+  assert.equal(repoPageUrl('git@github.com:'), null)
 })
 
 // ── normalizeDir：目录参数归一化 + ~ 展开 ─────────────────────────────────
