@@ -7,3 +7,7 @@ pnpm-lock.yaml
 /git-panel.log
 /git-panel.log.1
 *.log
+
+# 版面自查（不进仓库）：用假 React 驱动真实 client bundle、headless Chrome 截图。
+# 目录里是 .ui-preview/preview.cjs 与几张 light/dark/tall 截图，随时可删。
+/.ui-preview/

@@ -1950,3 +1950,179 @@ test('client standalone：窗口重新获得焦点时静默刷新一次状态（
   assert.equal(stateCalls, before + 1, '获得焦点应重新读一次状态')
   assert.ok(!textOf(after).includes('同步中…'), '后台刷新不该点亮「同步中…」打扰用户')
 })
+
+// ── 9. UI：底部状态条 / 固定结果区 / diff 抬头条 / 忙碌指示 ───────────────────
+//
+// 这一组盯的是「版面结构」本身：哪些东西必须常驻可见（状态、命令结果、
+// 待决定的事），哪些只是装饰（转圈、抬头条）。它们不是内部实现细节 ——
+// 面板长起来之后，「结果滚走了」「不知道自己在哪个分支」正是最常被抱怨的两件事。
+
+/** 按 className 找一个元素：className 可能是 'a b' 形态，按词匹配。 */
+function findByClass(tree, className) {
+  return flattenTree(tree).find((node) =>
+    node !== null && typeof node === 'object' && node.props !== undefined
+    && typeof node.props.className === 'string'
+    && node.props.className.split(' ').includes(className))
+}
+
+/** 状态条上那颗表示「上一次操作成没成」的小点。 */
+function statusDot(tree) {
+  const status = findByClass(tree, 'dgp-status')
+  if (status === undefined) return undefined
+  return flattenTree(status).find((node) => node.type === 'span' && textOf(node) === '●')
+}
+
+test('client standalone：底部状态条常驻显示分支 / 改动数 / 上游，且不在正文滚动区里', async () => {
+  const harness = makeFakeWindow({ stateResponse: REPO_WITH_CHANGES })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+
+  const status = findByClass(tree, 'dgp-status')
+  assert.ok(status !== undefined, '应渲染出底部状态条')
+  const text = textOf(status)
+  assert.ok(text.includes('main'), '状态条要写清当前分支：' + text)
+  assert.ok(text.includes('2 处改动未提交'), '状态条要写清还有多少改动：' + text)
+  assert.ok(text.includes('→ origin/main'), '状态条要写清上游：' + text)
+
+  const body = findByClass(tree, 'dgp-body')
+  assert.ok(body !== undefined, '应渲染出正文滚动区')
+  assert.ok(
+    !flattenTree(body).some((node) => node !== null && typeof node === 'object'
+      && node.props !== undefined && node.props.className === 'dgp-status'),
+    '状态条必须在正文滚动区之外，否则一滚就看不见了',
+  )
+  assert.ok(body.props.ref !== undefined && body.props.ref !== null, '正文要挂 ref（状态条点了要能回到顶部）')
+})
+
+test('client standalone：命令结果固定在正文之外，并且可以「清空」收起', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    opResponse: { ok: true, stdout: 'done-ok', state: REPO_WITH_CHANGES },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+  assert.equal(outputBars(initial).length, 0, '还没操作过就不该有结果区')
+  assert.equal(findButton(initial, '清空'), undefined, '没有结果时不该有「清空」')
+
+  await findButton(initial, '全部暂存').props.onClick()
+  const after = await react.settle()
+  assert.ok(outputBars(after).some((text) => text.includes('done-ok')), '操作结果要出现在结果区')
+  const body = findByClass(after, 'dgp-body')
+  assert.equal(
+    flattenTree(body).filter((node) => node.type === 'pre').length, 0,
+    '结果区必须在正文滚动区之外：点完按钮不用往下翻也知道刚才成没成',
+  )
+
+  // 点一下状态条（ref 上是假节点，这里自己补一个可写的 scrollTop）也要能工作。
+  const dot = statusDot(after)
+  assert.ok(dot !== undefined, '状态条上应有结果指示点')
+
+  await findButton(after, '清空').props.onClick()
+  const cleared = await react.settle()
+  assert.equal(outputBars(cleared).length, 0, '「清空」应把结果区收起来')
+  assert.equal(findButton(cleared, '清空'), undefined, '结果区没了，按钮也要跟着消失')
+})
+
+test('client standalone：状态条上的小点跟着上一次操作的结果变色', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    opResponses: {
+      addAll: { ok: true, state: REPO_WITH_CHANGES },
+      discard: { ok: false, message: '丢弃失败', state: REPO_WITH_CHANGES },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+  assert.ok(statusDot(initial).props.style.color.includes('label-tertiary'), '还没操作过时是中性色')
+
+  await findButton(initial, '全部暂存').props.onClick()
+  const okTree = await react.settle()
+  assert.ok(
+    statusDot(okTree).props.style.color.includes('state-success-primary'),
+    '成功之后点要变绿：' + statusDot(okTree).props.style.color,
+  )
+
+  await findButton(okTree, '丢弃改动').props.onClick()
+  const failTree = await react.settle()
+  assert.ok(
+    statusDot(failTree).props.style.color.includes('state-error-primary'),
+    '失败之后点要变红：' + statusDot(failTree).props.style.color,
+  )
+})
+
+test('client standalone：展开 diff 时先给出抬头条（哪个文件、哪一份）', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    opResponse: {
+      ok: true, diff: 'diff --git a/f.txt b/f.txt\n@@ -1 +1,2 @@\n one\n+two\n', state: REPO_WITH_CHANGES,
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+
+  const clickable = flattenTree(initial).find((node) =>
+    typeof node.props.title === 'string' && node.props.title.includes('点击查看 diff'))
+  await clickable.props.onClick()
+  const after = await react.settle()
+
+  const bar = findByClass(after, 'dgp-difftitle')
+  assert.ok(bar !== undefined, '展开的 diff 上方应有抬头条')
+  const text = textOf(bar)
+  assert.ok(text.includes('f.txt'), '抬头条要写清是哪个文件：' + text)
+  assert.ok(text.includes('未暂存'), '抬头条要写清这是工作区那份还是已暂存那份：' + text)
+  assert.ok(outputBars(after).some((line) => line.includes('+two')), 'diff 内容照常渲染')
+})
+
+test('client standalone：忙的时候头部是「同步中…」加一个纯装饰的转圈', async () => {
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const harness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    opResponses: { addAll: gate.then(() => ({ ok: true, stdout: 'done', state: REPO_WITH_CHANGES })) },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+  assert.equal(findByClass(initial, 'dgp-spin'), undefined, '不忙的时候不该有转圈')
+
+  // 不 await：让这次操作悬在「正在进行」的状态上，正好观察忙碌期的界面。
+  const pending = findButton(initial, '全部暂存').props.onClick()
+  const busyTree = await react.settle()
+  assert.ok(textOf(busyTree).includes('同步中…'), '忙的时候头部要显示「同步中…」')
+  const spin = findByClass(busyTree, 'dgp-spin')
+  assert.ok(spin !== undefined, '忙的时候应有一个转圈')
+  assert.equal(textOf(spin), '', '转圈里不能有文字：可见文案只有「同步中…」一句')
+
+  release()
+  await pending
+  const done = await react.settle()
+  assert.equal(findByClass(done, 'dgp-spin'), undefined, '操作结束后转圈要消失')
+})
+
+test('client standalone：双击左缘拖拽条恢复默认宽度（并清掉记住的宽度）', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    prefillStorage: { 'dsh-git-panel-width': '420' },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+  assert.equal(findByClass(tree, 'dgp-panel').props.style.width, '420px', '前置条件：记住了上次的宽度')
+
+  const handle = findByClass(tree, 'dgp-resize')
+  assert.equal(typeof handle.props.onDoubleClick, 'function', '拖拽条要支持双击恢复默认宽度')
+  handle.props.onDoubleClick()
+  const reset = await react.settle()
+  assert.equal(findByClass(reset, 'dgp-panel').props.style.width, '360px', '双击之后应回到默认宽度')
+  assert.equal(harness.storage.has('dsh-git-panel-width'), false, '记住的宽度要一起清掉，否则下次挂载又变回去')
+})
