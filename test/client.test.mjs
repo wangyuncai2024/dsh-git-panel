@@ -270,6 +270,8 @@ function evaluateBundle(harness, reactApi) {
     fetch: fetchStub,
     URL, JSON, Object, Array, String, Number, Boolean, Math, Date, RegExp, Error, Promise,
     setTimeout, clearTimeout, encodeURIComponent, decodeURIComponent, console,
+    // 目录选择小窗口用它取消在飞的列出（浏览器里本来就是全局对象）。
+    AbortController, AbortSignal,
     Event: class Event { constructor(type) { this.type = type } },
   }
   sandbox.globalThis = sandbox
@@ -297,7 +299,8 @@ test('client standalone：bundle 只 require 平台种子 react，不动其它�
   const { exports, requested } = evaluateBundle(harness, react.api)
   assert.deepEqual(requested, ['react'], '客户端半边只允许 require react（平台种子）；其它模块名换版本就没了')
   assert.equal(typeof exports.apply, 'function', '必须导出 apply')
-  assert.deepEqual(exports.inject, ['slots'], '必须声明 slots 依赖（界面全靠它）')
+  assert.deepEqual(exports.inject, ['slots', 'uiWorkspace'],
+    'slots 是界面依赖；uiWorkspace 是目录选择小窗口的目录服务（不声明就读不到 —— cordis 懒注入）')
 })
 
 test('client standalone：bundle 是普通脚本，没有 ESM / JSX / TS 语法', () => {
@@ -683,12 +686,23 @@ function selectSession(store, id) {
   return store
 }
 
-/** 在给定会话 store 上挂载面板组件（`store` 可变，用来模拟切换工作区）。 */
-function mountPanel(exports, react, store) {
+/**
+ * 在给定会话 store 上挂载面板组件（`store` 可变，用来模拟切换工作区）。
+ *
+ * 目录选择服务有两条注入路径，测试都要能走：
+ *   · `options.uiWorkspace` —— **真实路径**：cordis 按 inject 把服务放在 ctx 上，
+ *     apply 时从 `ctx.uiWorkspace` 取（就是运行中的宿主那条路）。
+ *   · `options.getPicker`   —— slot owner 直接塞给组件（测试替身/降级用）。
+ * 两个都不传 = 服务缺失，面板应当退化成「只能手输绝对路径」。
+ */
+function mountPanel(exports, react, store, options = {}) {
   const { slots, registered } = makeSlots()
-  exports.apply({ slots })
+  exports.apply({ slots, uiWorkspace: options.uiWorkspace })
   const panel = registered.find((entry) => entry.options.name === 'shell.overlay').component
-  react.mount(panel, { useSessions: (selector) => selector(store) })
+  react.mount(panel, {
+    useSessions: (selector) => selector(store),
+    getPicker: options.getPicker,
+  })
 }
 
 /** 命令结果栏（面板里所有 <pre> 的文本）。 */
@@ -804,7 +818,7 @@ test('client standalone：没有当前会话时退回宿主缺省目录，而不
   )
 })
 
-test('client standalone：手动切过目录后不再被会话目录覆盖（跟随会话按钮才恢复）', async () => {
+test('client standalone：手输目录（没有目录浏览服务时的退化路径）切过去后不再被会话目录覆盖', async () => {
   // 手填的目录必须由「宿主回传的 state.dir」确认（面板以宿主归一化后的路径为准），
   // 所以这一份响应的 dir 就是 /tmp/manual。
   const wsManual = { ...WS_B, dir: '/tmp/manual' }
@@ -822,17 +836,27 @@ test('client standalone：手动切过目录后不再被会话目录覆盖（跟
   assert.ok(switchButton !== undefined, '目录行应有「切换」按钮')
   switchButton.props.onClick()
 
+  const opened = await react.settle()
+  assert.ok(textOf(opened).includes('选择要查看的目录'), '点「切换」应弹出目录选择小窗口')
+  // 没有目录浏览服务：小窗口给出手输路径的入口（这条是「服务缺失也不白屏」的退化保证）。
+  assert.ok(textOf(opened).includes('没有提供目录浏览服务'), '没有目录服务时要说明并给出替代路径')
+  const pencil = flattenTree(opened).find((node) => node.props !== undefined && node.props['aria-label'] === '输入路径')
+  assert.ok(pencil !== undefined, '小窗口里应有「输入路径」按钮')
+  pencil.props.onClick()
+
   const editing = await react.settle()
-  const input = flattenTree(editing).find((node) => node.type === 'input')
-  assert.ok(input !== undefined, '点「切换」后应出现目录输入框')
+  // 面板底部的提交表单也有输入框：小窗口那个是树里最后一个。
+  const input = flattenTree(editing).filter((node) => node.type === 'input').pop()
+  assert.ok(input !== undefined, '点「输入路径」后应出现路径输入框')
   input.props.onChange({ target: { value: '/tmp/manual' } })
 
   const typed = await react.settle()
-  const confirm = findButton(typed, '确定')
-  assert.ok(confirm !== undefined, '输入框旁应有「确定」')
-  await confirm.props.onClick()
+  const typedInput = flattenTree(typed).filter((node) => node.type === 'input').pop()
+  typedInput.props.onKeyDown({ key: 'Enter', preventDefault: () => {} })
+
   const manual = await react.settle()
-  assert.ok(textOf(manual).includes('/tmp/manual'), '手动切换后应停在自己填的目录')
+  assert.ok(textOf(manual).includes('/tmp/manual'), '手输切换后应停在自己填的目录')
+  assert.ok(!textOf(manual).includes('选择要查看的目录'), '确认后小窗口要关掉')
 
   // 会话切走了：手动选过目录就不再跟随（这是有意的，避免覆盖用户的输入）。
   selectSession(store, 's-b')
@@ -845,6 +869,371 @@ test('client standalone：手动切过目录后不再被会话目录覆盖（跟
   await follow.props.onClick()
   const followed = await react.settle()
   assert.ok(textOf(followed).includes('/tmp/ws-b'), `点「跟随会话」后应回到会话 B 的目录，实际：${textOf(followed).slice(0, 300)}`)
+})
+
+// ── 6.5 目录选择小窗口（「切换」按钮 = 与 DSH「添加工作区」同一个选择器） ─────
+//
+// 这一节保的是「点了真的有那个小窗口」：浏览/进入/选中/确认/取消/新建文件夹，
+// 以及宿主目录服务缺失时不白屏（退化成手输路径）。
+//
+// 服务名与形状照抄宿主真实的 `uiWorkspace`（`listDirectory` / `createDirectory`）：
+// 面板是从 `ctx.uiWorkspace` 取的 —— 回归：曾照着 `ctx.remote.directoryPicker` 写，
+// 而 cordis 是懒注入，没在 inject 里声明的服务在插件上下文里读不到，小窗口于是
+// 永远显示「宿主没有提供目录浏览服务」。
+
+/** 一份假目录树，形状与宿主 uiWorkspace 回的 DirectoryListing 完全一致。 */
+function makeFakePicker(levels) {
+  const calls = { list: [], create: [] }
+  return {
+    calls,
+    service: {
+      listDirectory: async (path, signal) => {
+        calls.list.push({ path, signal })
+        const level = levels[path === undefined ? '' : path]
+        if (level === undefined) throw Object.assign(new Error('目录读不到'), { rpcError: { message: '目录读不到：' + String(path) } })
+        return level
+      },
+      createDirectory: async (parent, name) => {
+        calls.create.push({ parent, name })
+        const created = parent + '/' + name
+        // 真宿主创建完再列父目录时，新目录就在那一层里 —— 假替身照做，
+        // 否则「创建后选中它」这条链路在测试里根本验不到。
+        const level = levels[parent]
+        if (level !== undefined) {
+          level.entries = level.entries.concat([{ name, path: created, hidden: false }])
+        }
+        return created
+      },
+    },
+  }
+}
+
+const HOME_LEVEL = {
+  path: '/home/me', home: '/home/me',
+  crumbs: [{ name: '/', path: '/', hidden: false }, { name: 'me', path: '/home/me', hidden: false }],
+  entries: [
+    { name: 'project-a', path: '/home/me/project-a', hidden: false },
+    { name: '.cache', path: '/home/me/.cache', hidden: true },
+  ],
+  truncated: false,
+}
+
+/**
+ * 一份「宿主这次只组合了系统对话框（native）」的假服务，形状照抄真宿主的拒绝：
+ * list / createDirectory 要 browse 能力，组合出来的却是 native，于是回
+ * `directory-picker/unavailable` + `details.capability: 'native'`（见
+ * packages/api/workspace-controller/src/directory-picker.ts）；pickDirectory 可用。
+ *
+ * 回归的是：面板原来只认 browse 那条路，于是一打开小窗口就把宿主的英文能力错误
+ * （`directoryPicker.list needs the browse capability; the composed picker serves "native"`）
+ * 甩到界面上，系统对话框这条正道反而没走。
+ */
+function makeNativeOnlyPicker(chosen) {
+  const calls = { list: [], create: [], pick: [] }
+  const unavailable = (method) => Object.assign(
+    new Error(`directory browse failed: directory-picker/unavailable: directoryPicker.${method} needs the browse capability; the composed picker serves "native"`),
+    {
+      name: 'DirectoryBrowseError',
+      rpcError: {
+        code: 'directory-picker/unavailable',
+        message: `directoryPicker.${method} needs the browse capability; the composed picker serves "native"`,
+        details: { capability: 'native' },
+      },
+    },
+  )
+  return {
+    calls,
+    service: {
+      listDirectory: async (path) => { calls.list.push(path); throw unavailable('list') },
+      createDirectory: async (parent, name) => { calls.create.push({ parent, name }); throw unavailable('createDirectory') },
+      pickDirectory: async () => { calls.pick.push(true); return chosen },
+    },
+  }
+}
+
+test('client standalone：点「切换」弹出目录小窗口，选中目录后确认即切换（与添加工作区同一个选择器）', async () => {
+  const target = { ...WS_B, dir: '/home/me/project-a' }
+  const harness = makeFakeWindow({ stateResponse: WS_A })
+  harness.fetchStub = makeDirAwareFetch(harness, { '/tmp/ws-a': WS_A, '/home/me/project-a': target })
+  const fake = makeFakePicker({ '': HOME_LEVEL })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/ws-a' } }), { uiWorkspace: fake.service })
+
+  const first = await react.settle()
+  const switchButton = findButton(first, '切换')
+  assert.ok(switchButton !== undefined, '目录行应有「切换」按钮')
+  switchButton.props.onClick()
+
+  const opened = await react.settle()
+  const openedText = textOf(opened)
+  assert.ok(openedText.includes('选择要查看的目录'), `点「切换」应弹出小窗口，实际：${openedText.slice(0, 300)}`)
+  assert.ok(openedText.includes('与「添加工作区」同一个目录选择器'), '小窗口要说明它与添加工作区是同一个选择器')
+  assert.deepEqual(fake.calls.list.map((call) => call.path), [undefined], '打开时应向宿主列一次主目录（path 缺省）')
+  assert.ok(openedText.includes('project-a'), '列出的目录要画出来')
+  assert.ok(!openedText.includes('.cache'), '隐藏目录默认不显示（与宿主浏览器一致）')
+  assert.ok(openedText.includes('主目录'), '面包屑要从「主目录」开始')
+
+  // 显示隐藏文件：.cache 出现。
+  const toggle = flattenTree(opened).find((node) => node.type === 'button' && textOf(node) === '显示隐藏文件')
+  assert.ok(toggle !== undefined, '应有「显示隐藏文件」开关')
+  toggle.props.onClick()
+  const withHidden = await react.settle()
+  assert.ok(textOf(withHidden).includes('.cache'), '打开后隐藏目录要出现')
+
+  // 单击选中 project-a，再确认。
+  const row = flattenTree(withHidden).find((node) => node.type === 'button' && textOf(node).includes('project-a'))
+  assert.ok(row !== undefined, '应有 project-a 这一行')
+  row.props.onClick()
+  const selected = await react.settle()
+  assert.ok(
+    flattenTree(selected).some((node) => typeof node.props.className === 'string'
+      && node.props.className.includes('dgp-pick-row-selected')),
+    '单击要选中该行（选中态有独立类名）',
+  )
+
+  const confirm = findButton(selected, '选择此目录')
+  assert.ok(confirm !== undefined, '应有「选择此目录」按钮')
+  await confirm.props.onClick()
+  const after = await react.settle()
+
+  assert.ok(!textOf(after).includes('选择要查看的目录'), '确认后小窗口要关掉')
+  assert.ok(textOf(after).includes('/home/me/project-a'), `面板要切到选中的目录，实际：${textOf(after).slice(0, 300)}`)
+  assert.ok(findButton(after, '跟随会话') !== undefined, '手动选过目录后应出现「跟随会话」')
+})
+
+test('client standalone：小窗口里能进子目录（双击）与退回（面包屑），取消则什么都不动', async () => {
+  const child = {
+    path: '/home/me/project-a', home: '/home/me',
+    crumbs: [
+      { name: '/', path: '/', hidden: false },
+      { name: 'me', path: '/home/me', hidden: false },
+      { name: 'project-a', path: '/home/me/project-a', hidden: false },
+    ],
+    entries: [{ name: 'src', path: '/home/me/project-a/src', hidden: false }],
+    truncated: false,
+  }
+  const harness = makeFakeWindow({ stateResponse: WS_A })
+  const requested = []
+  const base = harness.fetchStub
+  harness.fetchStub = async (url, init) => {
+    if (String(url).includes('/git-panel/state')) requested.push(String(url))
+    return base(url, init)
+  }
+  const fake = makeFakePicker({ '': HOME_LEVEL, '/home/me/project-a': child })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/ws-a' } }), { uiWorkspace: fake.service })
+
+  const first = await react.settle()
+  findButton(first, '切换').props.onClick()
+  const opened = await react.settle()
+
+  // 双击 project-a 进入子目录。
+  const row = flattenTree(opened).find((node) => node.type === 'button' && textOf(node).includes('project-a'))
+  row.props.onDoubleClick()
+  const inside = await react.settle()
+  assert.ok(fake.calls.list.some((call) => call.path === '/home/me/project-a'), '双击应列出该目录')
+  assert.ok(textOf(inside).includes('src'), '应看到子目录 src')
+  assert.ok(textOf(inside).includes('project-a'), '面包屑里应出现 project-a')
+
+  // 点面包屑「主目录」退回。
+  const crumb = flattenTree(inside).find((node) => node.type === 'button' && textOf(node) === '主目录')
+  assert.ok(crumb !== undefined, '应有「主目录」面包屑')
+  crumb.props.onClick()
+  const back = await react.settle()
+  assert.ok(textOf(back).includes('project-a'), '退回后应重新看到 project-a')
+
+  // 取消：小窗口关掉，且一次状态请求都没为新目录发出去。
+  const before = requested.length
+  findButton(back, '取消').props.onClick()
+  const closed = await react.settle()
+  assert.ok(!textOf(closed).includes('选择要查看的目录'), '取消后小窗口要关掉')
+  assert.equal(requested.length, before, '取消不该触发任何目录切换')
+})
+
+test('client standalone：小窗口里能新建文件夹，创建成功后面板选中它', async () => {
+  const harness = makeFakeWindow({ stateResponse: WS_A })
+  harness.fetchStub = makeDirAwareFetch(harness, { '/tmp/ws-a': WS_A })
+  const fake = makeFakePicker({
+    '': { ...HOME_LEVEL, entries: HOME_LEVEL.entries.map((entry) => ({ ...entry })) },
+    '/home/me': { ...HOME_LEVEL, entries: HOME_LEVEL.entries.map((entry) => ({ ...entry })) },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/ws-a' } }), { uiWorkspace: fake.service })
+
+  const first = await react.settle()
+  findButton(first, '切换').props.onClick()
+  const opened = await react.settle()
+
+  const newFolder = findButton(opened, '新建文件夹')
+  assert.ok(newFolder !== undefined, '小窗口应有「新建文件夹」')
+  newFolder.props.onClick()
+
+  const creating = await react.settle()
+  assert.ok(textOf(creating).includes('在 '), '新建小窗口要说明建在哪')
+  const input = flattenTree(creating).filter((node) => node.type === 'input').pop()
+  assert.ok(input !== undefined, '新建小窗口应有名字输入框')
+  input.props.onChange({ target: { value: 'new-repo' } })
+  const typed = await react.settle()
+  const typedInput = flattenTree(typed).filter((node) => node.type === 'input').pop()
+  typedInput.props.onKeyDown({ key: 'Enter', preventDefault: () => {} })
+  const after = await react.settle()
+
+  assert.deepEqual(fake.calls.create, [{ parent: '/home/me', name: 'new-repo' }], '应把「父目录 + 名字」交给宿主创建')
+  assert.ok(!textOf(after).includes('在 '), '创建成功后新建小窗口要关掉')
+  assert.ok(
+    flattenTree(after).some((node) => typeof node.props.className === 'string'
+      && node.props.className.includes('dgp-pick-row-selected')
+      && textOf(node).includes('new-repo')),
+    '创建出来的文件夹应被选中',
+  )
+})
+
+test('client standalone：目录服务报错时，小窗口把宿主的业务消息显示出来（不白屏、不静默）', async () => {
+  const harness = makeFakeWindow({ stateResponse: WS_A })
+  const fake = makeFakePicker({}) // 任何路径都读不到
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/ws-a' } }), { uiWorkspace: fake.service })
+
+  const first = await react.settle()
+  findButton(first, '切换').props.onClick()
+  const opened = await react.settle()
+
+  assert.ok(textOf(opened).includes('选择要查看的目录'), '出错也要先把小窗口画出来')
+  assert.ok(textOf(opened).includes('目录读不到'), `要显示宿主的业务错误消息，实际：${textOf(opened).slice(0, 400)}`)
+  // 「目录读不到」是浏览能力**在**、只是这一层读不了：不能因此切成系统对话框模式，
+  // 否则用户会被莫名其妙地踢出网页浏览器（只有能力缺席才是那个场景）。
+  assert.ok(findButton(opened, '打开系统目录选择器…') === undefined, '普通读取失败不该退化成系统对话框模式')
+  assert.ok(findButton(opened, '选择此目录') !== undefined, '普通读取失败仍应留在浏览模式')
+})
+
+test('client standalone：宿主只组合了系统对话框时，小窗口改走 pickDirectory（不再甩 browse 错误）', async () => {
+  const target = { ...WS_B, dir: '/home/me/project-a' }
+  const harness = makeFakeWindow({ stateResponse: WS_A })
+  harness.fetchStub = makeDirAwareFetch(harness, { '/tmp/ws-a': WS_A, '/home/me/project-a': target })
+  const fake = makeNativeOnlyPicker('/home/me/project-a')
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/ws-a' } }), { uiWorkspace: fake.service })
+
+  const first = await react.settle()
+  findButton(first, '切换').props.onClick()
+  const opened = await react.settle()
+  const openedText = textOf(opened)
+
+  assert.ok(openedText.includes('选择要查看的目录'), '小窗口要照常画出来')
+  assert.ok(
+    !openedText.includes('needs the browse capability'),
+    `不该把宿主的英文能力错误甩给用户，实际：${openedText.slice(0, 400)}`,
+  )
+  assert.ok(openedText.includes('系统对话框'), '要说明宿主这次组合的是系统对话框')
+  assert.equal(fake.calls.list.length, 1, '打开时试列一次探测能力；失败后不再重试')
+  assert.ok(findButton(opened, '选择此目录') === undefined, 'native 模式下没有「选择此目录」')
+  assert.ok(findButton(opened, '新建文件夹') === undefined, 'native 模式下没有「新建文件夹」')
+
+  const open = findButton(opened, '打开系统目录选择器…')
+  assert.ok(open !== undefined, '应给出「打开系统目录选择器…」按钮')
+  await open.props.onClick()
+  const after = await react.settle()
+
+  assert.deepEqual(fake.calls.pick, [true], '按钮要真的调宿主的 pickDirectory')
+  assert.ok(!textOf(after).includes('选择要查看的目录'), '选到目录后小窗口要关掉')
+  assert.ok(
+    textOf(after).includes('/home/me/project-a'),
+    `面板要切到系统对话框选中的目录，实际：${textOf(after).slice(0, 300)}`,
+  )
+})
+
+test('client standalone：系统对话框取消（返回空）时小窗口留着，不静默关窗也不切目录', async () => {
+  const harness = makeFakeWindow({ stateResponse: WS_A })
+  harness.fetchStub = makeDirAwareFetch(harness, { '/tmp/ws-a': WS_A, '/home/me/project-a': WS_B })
+  const fake = makeNativeOnlyPicker(null) // 用户按了取消
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/ws-a' } }), { uiWorkspace: fake.service })
+
+  const first = await react.settle()
+  findButton(first, '切换').props.onClick()
+  const opened = await react.settle()
+  await findButton(opened, '打开系统目录选择器…').props.onClick()
+  const after = await react.settle()
+
+  assert.deepEqual(fake.calls.pick, [true], '确实调过系统对话框')
+  assert.ok(textOf(after).includes('选择要查看的目录'), '取消后小窗口要留着，别把用户晾在外面')
+  assert.ok(textOf(after).includes('/tmp/ws-a'), '取消不该换目录')
+})
+
+test('client standalone：native 模式下直接手输绝对路径，回车一步切过去（不再去列目录）', async () => {
+  const target = { ...WS_B, dir: '/home/me/project-b' }
+  const harness = makeFakeWindow({ stateResponse: WS_A })
+  harness.fetchStub = makeDirAwareFetch(harness, { '/tmp/ws-a': WS_A, '/home/me/project-b': target })
+  const fake = makeNativeOnlyPicker(null)
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/ws-a' } }), { uiWorkspace: fake.service })
+
+  const first = await react.settle()
+  findButton(first, '切换').props.onClick()
+  const opened = await react.settle()
+
+  const pen = flattenTree(opened).find((node) => node.type === 'button' && textOf(node) === '✎')
+  assert.ok(pen !== undefined, 'native 模式下也要有「直接输入路径」的入口')
+  pen.props.onClick()
+  const editing = await react.settle()
+  // 面板本体也有别的 .dgp-input；小窗口挂在整棵树的最后，所以取最后一个。
+  const input = flattenTree(editing).filter((node) => node.type === 'input' && node.props.className === 'dgp-input').pop()
+  assert.ok(input !== undefined, '应展开路径输入框')
+  input.props.onChange({ target: { value: '/home/me/project-b' } })
+  const typed = await react.settle()
+  flattenTree(typed)
+    .filter((node) => node.type === 'input' && node.props.className === 'dgp-input')
+    .pop()
+    .props.onKeyDown({ key: 'Enter', preventDefault: () => {} })
+  const after = await react.settle()
+
+  assert.equal(fake.calls.list.length, 1, '手输路径不该再去列目录（宿主没有 browse 能力，列也列不出来）')
+  assert.ok(!textOf(after).includes('选择要查看的目录'), '回车后小窗口要关掉')
+  assert.ok(
+    textOf(after).includes('/home/me/project-b'),
+    `面板要切到手输的目录，实际：${textOf(after).slice(0, 300)}`,
+  )
+})
+
+test('client standalone：目录服务只认 ctx.uiWorkspace（回归：曾读 ctx.remote.directoryPicker，永远拿不到）', async () => {
+  const harness = makeFakeWindow({ stateResponse: WS_A })
+  const fake = makeFakePicker({ '': HOME_LEVEL })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+
+  // 服务放在 ctx.uiWorkspace 上（cordis 按 inject 注入的真身位置），
+  // 同时在 ctx.remote.directoryPicker 上放一个**同名但会抛错**的诱饵：
+  // 谁再照着 remote 那条路取，就会打中诱饵、或者干脆取不到。
+  const { slots, registered } = makeSlots()
+  let decoyHit = 0
+  exports.apply({
+    slots,
+    uiWorkspace: fake.service,
+    remote: {
+      directoryPicker: {
+        list: async () => { decoyHit += 1; throw new Error('不该走 remote.directoryPicker') },
+        createDirectory: async () => { decoyHit += 1; throw new Error('不该走 remote.directoryPicker') },
+      },
+    },
+  })
+  const panel = registered.find((entry) => entry.options.name === 'shell.overlay').component
+  react.mount(panel, { useSessions: (selector) => selector(sessionStore({ s1: { cwd: '/tmp/ws-a' } })) })
+
+  const first = await react.settle()
+  findButton(first, '切换').props.onClick()
+  const opened = await react.settle()
+
+  assert.ok(fake.calls.list.length >= 1, '打开小窗口必须真的向 uiWorkspace 列一次目录')
+  assert.equal(decoyHit, 0, '不能去碰 ctx.remote.directoryPicker')
+  assert.ok(textOf(opened).includes('project-a'), '列出来的目录要画进小窗口')
+  assert.ok(!textOf(opened).includes('宿主没有提供目录浏览服务'), '服务可用时不该显示「没有提供目录浏览服务」')
 })
 
 test('client standalone：切走之后才回来的操作结果不能盖到新工作区上', async () => {
