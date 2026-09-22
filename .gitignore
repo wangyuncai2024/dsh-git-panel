@@ -9,5 +9,5 @@ pnpm-lock.yaml
 *.log
 
 # 版面自查（不进仓库）：用假 React 驱动真实 client bundle、headless Chrome 截图。
-# 目录里是 .ui-preview/preview.cjs 与几张 light/dark/tall 截图，随时可删。
+# 目录已清空删除；将来重建（preview.cjs + light/dark/tall 截图）也照样不入库。
 /.ui-preview/
