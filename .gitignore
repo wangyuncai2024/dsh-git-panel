@@ -2,8 +2,8 @@ node_modules/
 pnpm-lock.yaml
 .DS_Store
 
-# 插件操作日志：默认就落在启动 dsh 时的工作区目录（process.cwd()），
-# 也就是这份插件源码所在的目录 —— 只在本机看，不入库。
+# 插件操作日志：固定落在插件仓库根目录（lib/log.js 用 import.meta.url 推导，
+# 不跟 process.cwd() 走）—— 只在本机看，不入库。
 /git-panel.log
 /git-panel.log.1
 *.log

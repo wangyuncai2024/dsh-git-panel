@@ -7,9 +7,11 @@
 
 import test, { after, before } from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   parseBranchLine,
   parseRemotes,
@@ -632,9 +634,12 @@ test('renderHelpHtml：命令里的引号被转义进属性，不会截断 HTML'
 
 // ── 日志模块（临时目录，不碰用户真实主目录、也不写进仓库根） ────────────────
 //
-// 日志**默认**落在启动 dsh 时的工作区目录（process.cwd()），所以这里每个用例都
+// 日志**默认**落在本插件仓库根目录（lib/log.js 的上一级），所以这里每个用例都
 // 显式把 logFile 指到临时目录：否则用例之间、乃至并行运行的其它测试文件会一起
-// 往工作区那个 git-panel.log 里写，行数断言立刻变成随机的。
+// 往仓库根那个 git-panel.log 里写，行数断言立刻变成随机的。
+
+/** 本仓库根目录：`test/unit.test.mjs` 的上一级（与 lib/log.js 推导出的那个一致）。 */
+const repoRoot = fileURLToPath(new URL('..', import.meta.url))
 
 let logHome = null
 
@@ -656,9 +661,19 @@ after(async () => {
   if (logHome !== null) await rm(logHome, { recursive: true, force: true })
 })
 
-test('日志：默认落在启动目录（工作区），不再写进 $DSH_HOME', () => {
+test('日志：默认落在本插件仓库根目录，且与启动目录（process.cwd()）无关', () => {
   setLogConfig({})
-  assert.equal(logFilePath(), join(process.cwd(), 'git-panel.log'))
+  assert.equal(logFilePath(), join(repoRoot, 'git-panel.log'))
+
+  // 只比对上面的常量还不够 —— 跑测试时 cwd 恰好也是仓库根，等式两边会一起变。
+  // 真正锁住「不跟 cwd 走」：在一个无关目录里起一个 node 进程，读它算出的默认路径。
+  const entry = new URL('../lib/log.js', import.meta.url).href
+  const probe = `import { logFilePath } from ${JSON.stringify(entry)}; process.stdout.write(logFilePath())`
+  const out = execFileSync(process.execPath, ['--input-type=module', '-e', probe], {
+    cwd: tmpdir(),
+    encoding: 'utf8',
+  })
+  assert.equal(out, join(repoRoot, 'git-panel.log'), '换个 cwd 启动，日志路径必须原地不动')
 })
 
 test('日志：级别归一化 —— 非法/缺省落 info，off 是可用的合法值', () => {

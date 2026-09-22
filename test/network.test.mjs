@@ -443,7 +443,9 @@ const SAME_ORIGIN = { origin: 'http://127.0.0.1:3080', host: '127.0.0.1:3080' }
 /** 拿到真实注册的路由（走一遍 apply，等价于真的加载插件）。 */
 function mountRoutes() {
   const { ctx, routes } = makeCtx()
-  apply(ctx, {})
+  // apply 会写一条 lifecycle 日志：显式钉到临时目录，别让跑测试这件事在插件仓库
+  // 根目录里留下 git-panel.log（默认路径见 lib/log.js）。
+  apply(ctx, { logFile: join(home, 'test-lifecycle.log') })
   const find = (path) => {
     const route = routes.find((item) => item.path === path)
     assert.ok(route !== undefined, '没有注册路由 ' + path)
@@ -725,13 +727,13 @@ test('network：[集成] 参数非法时的早期错误响应形状与成功分�
 test('network：[路由] 注册了 log 路由，GET 返回最近日志行，重参数不炸', async () => {
   const { apply, setLogConfig } = await import('../lib/index.js')
   const harness = makeCtx()
-  apply(harness.ctx, {})
+  // 日志默认落在**本插件仓库根目录**，测试里显式指到临时目录，别把用例的
+  // 记录写进仓库根：apply 也要带上同一个 logFile，否则它那条 lifecycle 会先落进默认路径。
+  const path = join(home, 'git-panel.log')
+  apply(harness.ctx, { logFile: path })
   const logRoute = harness.routes.find((route) => route.path === '/git-panel/log')
   assert.ok(logRoute !== undefined, '应注册 /git-panel/log')
 
-  // 日志默认落在**启动目录**（工作区），测试里显式指到临时目录，别把用例的
-  // 记录写进仓库根：apply 之后显式设置，是因为 apply 会用行配置覆盖一次日志配置。
-  const path = join(home, 'git-panel.log')
   setLogConfig({ file: path })
   const { appendLog, logFilePath } = await import('../lib/index.js')
   assert.equal(logFilePath(), path, '显式配置的日志路径应生效')

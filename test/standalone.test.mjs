@@ -20,10 +20,13 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-// 日志会落在 $DSH_HOME 下；测试期间把它指到临时目录，绝不能写进用户真实主目录。
+// 日志默认落在插件仓库根目录；测试期间把它钉到临时目录，别让「跑一次测试」在仓库根
+// 留下 git-panel.log（默认路径由 lib/log.js 从 import.meta.url 推导，与 cwd 无关）。
 let tempHome = null
+let tempLog = null
 before(async () => {
   tempHome = await mkdtemp(join(tmpdir(), 'git-panel-standalone-'))
+  tempLog = join(tempHome, 'git-panel.log')
   process.env.DSH_HOME = tempHome
 })
 after(async () => {
@@ -188,7 +191,7 @@ test('standalone：import 宿主半边不抛异常，且只依赖 node: 内置�
 test('standalone：webServer / tools 就绪时，apply 直接注册成功', () => {
   const harness = makeCtx()
   return import('../lib/index.js').then(({ apply }) => {
-    assert.doesNotThrow(() => apply(harness.ctx, {}))
+    assert.doesNotThrow(() => apply(harness.ctx, { logFile: tempLog }))
     assert.equal(harness.routes.length, 6, '应注册 6 条路由（state/op/net/diag/log/help）')
     assert.equal(harness.tools.length, 13, '应注册 13 个 git 工具')
     const paths = harness.routes.map((route) => route.path).sort()
@@ -203,7 +206,7 @@ test('standalone：webServer / tools 就绪时，apply 直接注册成功', () =
 test('standalone：webServer / tools 稍后就绪时，apply 不抛异常且不丢注册', async () => {
   const { apply } = await import('../lib/index.js')
   const harness = makeCtx({ deferServices: true })
-  assert.doesNotThrow(() => apply(harness.ctx, {}))
+  assert.doesNotThrow(() => apply(harness.ctx, { logFile: tempLog }))
   assert.equal(harness.routes.length, 0, '服务未就绪时不应有路由')
   assert.equal(harness.tools.length, 0, '服务未就绪时不应有工具')
   harness.flushInject()
@@ -214,21 +217,24 @@ test('standalone：webServer / tools 稍后就绪时，apply 不抛异常且不�
 test('standalone：webServer / tools 都不存在时，apply 也不抛异常（面板/工具降级）', async () => {
   const { apply } = await import('../lib/index.js')
   const harness = makeCtx({ withWebServer: false, withTools: false })
-  assert.doesNotThrow(() => apply(harness.ctx, {}))
+  assert.doesNotThrow(() => apply(harness.ctx, { logFile: tempLog }))
   assert.equal(harness.routes.length, 0)
   assert.equal(harness.tools.length, 0)
 })
 
 test('standalone：ctx 连 get / inject / effect 都没有时（老/裁剪版本）也不抛异常', async () => {
   const { apply } = await import('../lib/index.js')
-  assert.doesNotThrow(() => apply({}, {}))
+  assert.doesNotThrow(() => apply({}, { logFile: tempLog }))
+  // 这一条必须传 undefined（测的就是「config 缺省」）：apply 会把日志配置重置回默认路径。
+  // 它那条 lifecycle 是队列里的异步写，实测在测试进程退出前不会落盘；真落盘也只是插件
+  // 仓库根那份 git-panel.log（已在 .gitignore 里）。
   assert.doesNotThrow(() => apply({ get: () => undefined }, undefined))
 })
 
 test('standalone：卸载会清空路由与工具（可重复 apply / dispose）', async () => {
   const { apply } = await import('../lib/index.js')
   const harness = makeCtx()
-  apply(harness.ctx, {})
+  apply(harness.ctx, { logFile: tempLog })
   assert.equal(harness.routes.length, 6)
   assert.equal(harness.tools.length, 13)
   harness.dispose()
@@ -241,7 +247,7 @@ test('standalone：卸载会清空路由与工具（可重复 apply / dispose）
 test('standalone：13 个工具名唯一、schema 合法、必填项都声明了', async () => {
   const { apply } = await import('../lib/index.js')
   const harness = makeCtx()
-  apply(harness.ctx, {})
+  apply(harness.ctx, { logFile: tempLog })
   const names = harness.tools.map((tool) => tool.name)
   assert.equal(new Set(names).size, names.length, '工具名不能重复')
   for (const tool of harness.tools) {
@@ -267,7 +273,7 @@ test('standalone：13 个工具名唯一、schema 合法、必填项都声明了
 test('standalone：工具 execute 对缺参/非法参**抛错**（让 harness 标成失败调用）', async () => {
   const { apply } = await import('../lib/index.js')
   const harness = makeCtx()
-  apply(harness.ctx, {})
+  apply(harness.ctx, { logFile: tempLog })
   const byName = new Map(harness.tools.map((tool) => [tool.name, tool]))
   const exec = { signal: undefined, agent: undefined }
   // 契约变更（原来返回一段普通文本）：execute 抛出的异常会被 harness 记成**失败的调用**，
