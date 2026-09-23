@@ -550,6 +550,62 @@ test('network：[路由] POST 跨站来源被拒绝（该接口决定 git 命令
   assert.equal((await readNetConfig()).mirrorEnabled, false, '被拒绝的请求不能留下任何改动')
 })
 
+test('network：[路由] 跨站拒绝的原因要写进响应体（否则桌面版这类误判无从排查）', async () => {
+  const { net } = mountRoutes()
+  const { status, data } = await callRoute(net, {
+    method: 'POST',
+    headers: { origin: 'http://evil.example', host: '127.0.0.1:3080' },
+    body: { mirrorEnabled: true },
+  })
+  assert.equal(status, 403)
+  assert.match(String(data.message), /evil\.example/, '错误信息要带上来访的 Origin')
+  assert.match(String(data.message), /127\.0\.0\.1:3080/, '错误信息要带上本站的 Host')
+})
+
+test('network：[路由] 桌面版形态的来源不该被误判成跨站（缺 Origin / null / 自定义协议 / 回环端口）', async () => {
+  // 桌面版（Electron 外壳）的页面不一定从「与 Host 逐字相同」的来源打开：可能不带
+  // Origin、带 `Origin: null`、带自定义协议，或者经另一个回环端口转发。这些请求过去
+  // 全被 403「请求来源不可信」拒掉 —— 而 GET 不校验来源，面板读状态一切正常，只有
+  // 每个 POST 失败，用户完全看不出原因。下面每一种都必须能正常保存配置。
+  const shapes = [
+    ['缺 Origin', { host: '127.0.0.1:3080' }],
+    ['Origin: null', { origin: 'null', host: '127.0.0.1:3080' }],
+    ['自定义协议', { origin: 'dsh://app', host: '127.0.0.1:3080' }],
+    ['file 协议', { origin: 'file://', host: '127.0.0.1:3080' }],
+    ['本机别名', { origin: 'http://localhost:3080', host: '127.0.0.1:3080' }],
+    ['外壳回环端口', { origin: 'http://localhost:51999', host: '127.0.0.1:3080' }],
+    ['IPv6 回环', { origin: 'http://[::1]:3080', host: '[::1]:3080' }],
+  ]
+  for (const [name, headers] of shapes) {
+    const { net } = mountRoutes()
+    // 模拟面板行为：先 GET 拿令牌，再用这个形态 POST。
+    const view = (await callRoute(net, { method: 'GET', headers })).data
+    const saved = await callRoute(net, {
+      method: 'POST',
+      headers,
+      body: { mirrorEnabled: true, csrf: view.csrf },
+    })
+    assert.equal(saved.status, 200, name + ' 不该被当成跨站')
+    assert.equal(saved.data.ok, true, name + ' 保存配置应成功')
+    resetNetConfigCache()
+    await rm(netConfigPath(), { force: true })
+  }
+})
+
+test('network：[路由] 放宽来源之后令牌仍是硬门槛：缺 Origin 也不等于免令牌', async () => {
+  const { net } = mountRoutes()
+  const view = (await callRoute(net, { method: 'GET' })).data
+  assert.ok(typeof view.csrf === 'string' && view.csrf.length > 0)
+
+  const blocked = await callRoute(net, {
+    method: 'POST',
+    headers: { host: '127.0.0.1:3080' },
+    body: { mirrorEnabled: true },
+  })
+  assert.equal(blocked.status, 403, '令牌才是真正的门槛')
+  assert.match(String(blocked.data.message), /令牌/)
+})
+
 test('network：[路由] 非法方法返回 405，坏 JSON 不炸掉服务', async () => {
   const { net } = mountRoutes()
   const put = await callRoute(net, { method: 'PUT', headers: SAME_ORIGIN })
