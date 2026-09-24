@@ -195,6 +195,8 @@ function makeFakeWindow(options = {}) {
   const storage = new Map()
   const listeners = new Map()
   const calls = { fetch: [], diag: [] }
+  /** 面板注册的定时器（假时钟不会自己走，只记录「注册了没有 / 间隔多少 / 有没有被清」）。 */
+  const timers = []
   if (options.prefillStorage !== undefined) {
     for (const [key, value] of Object.entries(options.prefillStorage)) storage.set(key, value)
   }
@@ -207,6 +209,14 @@ function makeFakeWindow(options = {}) {
     },
     addEventListener: (type, listener) => { listeners.set(type, listener) },
     removeEventListener: (type) => { listeners.delete(type) },
+    setInterval: (listener, ms) => {
+      const timer = { listener, ms, cleared: false }
+      timers.push(timer)
+      return timer
+    },
+    clearInterval: (timer) => {
+      if (timer !== null && timer !== undefined) timer.cleared = true
+    },
     dispatchEvent: () => true,
     confirm: () => true,
   }
@@ -215,6 +225,12 @@ function makeFakeWindow(options = {}) {
     ahead: 0, behind: 0, changes: [], log: [], remotes: [], notice: '不是仓库',
   }
   const opResponse = options.opResponse ?? stateResponse
+  /**
+   * 状态响应可以在**每次请求时**求值（options.stateResponse 传函数），并且每次返回新对象 ——
+   * 真实的 `fetch(...).json()` 就是这么干的，而 `state.snapshot` 的对象身份正是「依赖它的
+   * effect 会不会重跑」的根据（例如「状态一变就重列分支」）。传静态对象的老用例照旧。
+   */
+  const stateFor = () => (typeof options.stateResponse === 'function' ? options.stateResponse() : stateResponse)
   /**
    * 每个 op 可以给不同的响应（options.opResponses，按 op 名索引）；没配的 op 仍然
    * 落在 opResponse 上 —— 老用例因此一行都不用改。
@@ -252,10 +268,10 @@ function makeFakeWindow(options = {}) {
         : netResponse
       return { status: 200, json: async () => body }
     }
-    const body = String(url).includes('/git-panel/op') ? opResponseFor(init) : stateResponse
+    const body = String(url).includes('/git-panel/op') ? opResponseFor(init) : stateFor()
     return { status: 200, json: async () => body }
   }
-  return { win, registrations, storage, listeners, calls, fetchStub, netResponse }
+  return { win, registrations, storage, listeners, timers, calls, fetchStub, netResponse }
 }
 
 /**
@@ -2021,6 +2037,9 @@ const REPO_WITH_CHANGES = {
   pageUrl: 'https://github.com/user/demo',
 }
 
+/** 同一个仓库，但工作区干净（改动数为 0）—— 用来盯「干净时还会不会轮询」。 */
+const REPO_CLEAN = { ...REPO_WITH_CHANGES, changes: [], changesTotal: 0 }
+
 test('client standalone：改动行有单文件「暂存 / 取消暂存」按钮，点击把路径交给宿主', async () => {
   const harness = makeFakeWindow({ stateResponse: REPO_WITH_CHANGES })
   const react = makeStatefulReact()
@@ -2340,6 +2359,87 @@ test('client standalone：窗口重新获得焦点时静默刷新一次状态（
   assert.ok(!textOf(after).includes('同步中…'), '后台刷新不该点亮「同步中…」打扰用户')
 })
 
+test('client standalone：工作区干净时也会慢速轮询（外部的切分支 / 提交不会一直不显示）', async () => {
+  // 有未提交改动 → 20 秒快档：胶囊红点与改动数要跟得上编辑器。
+  const dirty = makeFakeWindow({ stateResponse: REPO_WITH_CHANGES })
+  const dirtyReact = makeStatefulReact()
+  mountPanel(evaluateBundle(dirty, dirtyReact.api).exports, dirtyReact, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  await dirtyReact.settle()
+  const dirtyTimer = dirty.timers.find((timer) => timer.cleared !== true)
+  assert.ok(dirtyTimer !== undefined, '有未提交改动时应注册轮询定时器')
+  assert.equal(dirtyTimer.ms, 20000, '有改动走 20 秒快档')
+
+  // 干净仓库 → 60 秒慢档，但**必须存在**：切分支 / 拉取 / 别人替你提交都发生在干净的时候，
+  // 没有这条轮询，面板会一直停在旧分支上，直到用户碰巧切了一次标签页。
+  const clean = makeFakeWindow({ stateResponse: REPO_CLEAN })
+  const cleanReact = makeStatefulReact()
+  mountPanel(evaluateBundle(clean, cleanReact.api).exports, cleanReact, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  await cleanReact.settle()
+  const cleanTimer = clean.timers.find((timer) => timer.cleared !== true)
+  assert.ok(cleanTimer !== undefined, '干净仓库也要轮询：否则外部的切分支 / 提交面板永远不显示')
+  assert.equal(cleanTimer.ms, 60000, '干净仓库走 60 秒慢档')
+
+  // 不是仓库时不轮询（没有可读的状态，白跑 git 进程）。
+  const noRepo = makeFakeWindow()
+  const noRepoReact = makeStatefulReact()
+  mountPanel(evaluateBundle(noRepo, noRepoReact.api).exports, noRepoReact, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  await noRepoReact.settle()
+  assert.equal(
+    noRepo.timers.filter((timer) => timer.cleared !== true).length,
+    0,
+    '「不是仓库」时不该注册轮询定时器',
+  )
+})
+
+test('client standalone：分支管理开着时状态一变就重列分支（外部删掉的分支不会留在列表里）', async () => {
+  // 宿主每次回的分支列表可以变：先用「main + master」，外部删掉 master 之后只回 main。
+  const branchReply = {
+    ok: true,
+    branches: { current: 'main', items: [{ name: 'main', current: true }, { name: 'master' }] },
+    remoteBranches: { defaultRef: null, items: [] },
+    state: null,
+  }
+  const harness = makeFakeWindow({
+    // 函数形态：每次读状态回一个**新对象**（真实 fetch 解析 JSON 也是新对象），
+    // 这样「state.snapshot 换了对象 → 该重跑那条 effect」才成立。
+    stateResponse: () => ({ ...REPO_WITH_CHANGES }),
+    opResponses: { branches: branchReply },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+
+  await findButton(initial, '管理').props.onClick()
+  let tree = await react.settle()
+  const branchCalls = () => harness.calls.fetch
+    .filter((call) => String(call.url).includes('/git-panel/op'))
+    .map((call) => JSON.parse(call.init.body))
+    .filter((payload) => payload.op === 'branches')
+  assert.equal(branchCalls().length, 1, '展开管理器查一次分支')
+  assert.ok(
+    flattenTree(tree).map(textOf).some((text) => text.trim() === 'master'),
+    '刚展开时列表里应有 master',
+  )
+
+  // 外部的删除（终端 / AI 工具 / 另一个会话）发生了：下一次状态读之后，列表必须跟着重列。
+  branchReply.branches = { current: 'main', items: [{ name: 'main', current: true }] }
+  const refresh = harness.listeners.get('focus')
+  assert.equal(typeof refresh, 'function', '需要 focus 触发的静默刷新来模拟「状态变了」')
+  const stateCalls = () => harness.calls.fetch
+    .filter((call) => String(call.url).includes('/git-panel/state')).length
+  const beforeState = stateCalls()
+  refresh()
+  tree = await react.settle()
+  assert.ok(stateCalls() > beforeState, `focus 应重新读一次状态（${beforeState} → ${stateCalls()}）`)
+
+  assert.equal(branchCalls().length, 2, '状态一变要重新列一次分支：' + JSON.stringify(branchCalls()))
+  assert.ok(
+    !flattenTree(tree).map(textOf).some((text) => text.trim() === 'master'),
+    '外部删掉的分支不该继续挂在列表里',
+  )
+})
+
 // ── 9. UI：底部状态条 / 固定结果区 / diff 抬头条 / 忙碌指示 ───────────────────
 //
 // 这一组盯的是「版面结构」本身：哪些东西必须常驻可见（状态、命令结果、
@@ -2514,4 +2614,144 @@ test('client standalone：双击左缘拖拽条恢复默认宽度（并清掉记
   const reset = await react.settle()
   assert.equal(findByClass(reset, 'dgp-panel').props.style.width, '360px', '双击之后应回到默认宽度')
   assert.equal(harness.storage.has('dsh-git-panel-width'), false, '记住的宽度要一起清掉，否则下次挂载又变回去')
+})
+
+// ── 本地分支名 ≠ 上游分支名：提前说 / 就地拦（本次的真实现场） ──────────────
+//
+// 现场：本地 `origin-main` 跟踪 `origin/main`。用户点了「推送」才看到一句
+// `fatal: The upstream branch of your current branch does not match …` ——
+// 面板既没提前提醒，也没告诉他怎么办。下面两条盯的是「提前」和「不再造出这种名字」。
+
+/** 按 placeholder 找输入框：页面里 class 为 dgp-input 的输入框有好几个。 */
+function findInputByPlaceholder(tree, fragment) {
+  return flattenTree(tree).find((node) =>
+    node !== null && typeof node === 'object' && node.props !== undefined
+    && node.type === 'input' && typeof node.props.placeholder === 'string'
+    && node.props.placeholder.includes(fragment))
+}
+
+test('client standalone：本地分支名与上游名不一致时，状态条提前标出来', async () => {
+  const mismatchState = { ...REPO_WITH_CHANGES, branch: 'origin-main', upstream: 'origin/main' }
+  const harness = makeFakeWindow({ stateResponse: mismatchState })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+
+  const warn = findByClass(tree, 'dgp-status-warn')
+  assert.ok(warn !== undefined, '两边名字不一致时状态条要给一个提醒')
+  assert.equal(textOf(warn), '名称不一致')
+  assert.match(String(warn.props.title), /push/, '提示里要说到「推送会被 git 拒绝」这件事')
+
+  // 同名时绝不能出现这个标（否则天天误报，用户就不看了）。
+  const normal = makeFakeWindow({ stateResponse: { ...REPO_WITH_CHANGES, branch: 'main', upstream: 'origin/main' } })
+  const normalReact = makeStatefulReact()
+  mountPanel(
+    evaluateBundle(normal, normalReact.api).exports,
+    normalReact,
+    sessionStore({ s1: { cwd: '/tmp/demo' } }),
+  )
+  const normalTree = await normalReact.settle()
+  assert.equal(findByClass(normalTree, 'dgp-status-warn'), undefined, '同名时不该出现提醒')
+
+  // 没有上游时也不该报（那是「未设上游」，另一回事）。
+  const noUpstream = makeFakeWindow({ stateResponse: { ...REPO_WITH_CHANGES, branch: 'main', upstream: null } })
+  const noUpstreamReact = makeStatefulReact()
+  mountPanel(
+    evaluateBundle(noUpstream, noUpstreamReact.api).exports,
+    noUpstreamReact,
+    sessionStore({ s1: { cwd: '/tmp/demo' } }),
+  )
+  assert.equal(
+    findByClass(await noUpstreamReact.settle(), 'dgp-status-warn'),
+    undefined,
+    '没有上游时不该报「名称不一致」',
+  )
+})
+
+test('client standalone：新建分支名撞上远端名时就地拦下，不发给宿主', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: {
+      ...REPO_WITH_CHANGES,
+      remotes: [{ name: 'origin', url: 'https://github.com/user/demo.git' }],
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+  await findButton(initial, '管理').props.onClick()
+  let tree = await react.settle()
+
+  const createdOps = () => harness.calls.fetch
+    .filter((call) => String(call.url).includes('/git-panel/op'))
+    .map((call) => JSON.parse(call.init.body))
+    .filter((payload) => payload.op === 'createBranch')
+
+  // 命中：输入 origin/main（本地分支会和 refs/remotes/origin/main 变成两个同名引用）。
+  findInputByPlaceholder(tree, '新分支名').props.onChange({ target: { value: 'origin/main' } })
+  tree = await react.settle()
+  const warn = findByClass(tree, 'dgp-branchname-warn')
+  assert.ok(warn !== undefined, '撞远端名时要就地告警')
+  assert.ok(textOf(warn).includes('origin'), '告警要指出撞的是哪个远端名：' + textOf(warn))
+  assert.equal(findButton(tree, '新建').props.disabled, true, '撞名时「新建」按钮要锁住')
+
+  // 输入框回车那条路**不经过**按钮的 disabled —— 钩子里必须再挡一次。
+  findInputByPlaceholder(tree, '新分支名').props.onKeyDown({ key: 'Enter', preventDefault() {} })
+  await react.settle()
+  assert.equal(createdOps().length, 0, '撞名的分支名不该发给宿主：' + JSON.stringify(createdOps()))
+
+  // 去掉前缀就该放行（不能把 feat/x 这类正常分支名一起误伤）。
+  findInputByPlaceholder(tree, '新分支名').props.onChange({ target: { value: 'main' } })
+  tree = await react.settle()
+  assert.equal(findByClass(tree, 'dgp-branchname-warn'), undefined, '正常分支名不该报警')
+  assert.equal(findButton(tree, '新建').props.disabled, false, '正常分支名要能建')
+})
+
+// ── 两个远程指向同一地址：提示 + 一键删多余的 ──────────────────────────────
+//
+// 现场：remote `main` 与 `origin` 指向同一个 GitHub 地址。除了冗余，它还会让
+// `git log main` / `git branch -D main` 报 `warning: refname 'main' is ambiguous`。
+// 判断在宿主侧（git.js 的 duplicateRemotes），这里盯的是「提示出现 + 一键能删对那个」。
+
+test('client standalone：两个远程指向同一地址时给出警告行与一键删除', async () => {
+  const duplicated = {
+    ...REPO_WITH_CHANGES,
+    remotes: [
+      { name: 'main', url: 'https://github.com/user/demo.git' },
+      { name: 'origin', url: 'https://github.com/user/demo.git' },
+    ],
+    duplicateRemotes: [{ url: 'https://github.com/user/demo.git', keep: 'origin', remove: ['main'] }],
+  }
+  const harness = makeFakeWindow({ stateResponse: duplicated })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+
+  const row = findByClass(tree, 'dgp-dup-remote')
+  assert.ok(row !== undefined, '重复远程要给一行提示')
+  assert.ok(textOf(row).includes('main'), '提示里要点名重复的那个远程：' + textOf(row))
+  assert.ok(textOf(row).includes('origin'), '也要说清保留的是哪个')
+
+  const remove = findButton(tree, '删掉 main')
+  assert.ok(remove !== undefined, '提示行上要有「删掉 main」')
+  await remove.props.onClick()
+  await react.settle()
+  const removed = harness.calls.fetch
+    .filter((call) => String(call.url).includes('/git-panel/op'))
+    .map((call) => JSON.parse(call.init.body))
+    .filter((payload) => payload.op === 'removeRemote')
+  assert.equal(removed.length, 1, '应该 POST 一次 removeRemote')
+  assert.equal(removed[0].name, 'main', '删的必须是提示里点名的那个远程')
+
+  // 没有重复时不该出现这一行（否则天天挂着一条无意义的警告）。
+  const clean = makeFakeWindow({ stateResponse: { ...REPO_WITH_CHANGES, duplicateRemotes: [] } })
+  const cleanReact = makeStatefulReact()
+  mountPanel(evaluateBundle(clean, cleanReact.api).exports, cleanReact, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  assert.equal(
+    findByClass(await cleanReact.settle(), 'dgp-dup-remote'),
+    undefined,
+    '没有重复远程时不该有这一行',
+  )
 })

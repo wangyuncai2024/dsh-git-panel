@@ -20,6 +20,17 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+// 让**本进程**里所有 git 子进程都用 core.autocrlf=false 跑。
+//
+// 为什么：Windows 上 `core.autocrlf=true`（git 安装器的默认勾选）会让临时仓库里
+// checkout 出来的文件带上 CRLF，而用例断言的是 `'内容\n'` —— 于是 stashPull /
+// stashSwitch 这 4 条在干净代码上也永远红着（实测过），真回归反而被埋在噪音里。
+// 用 GIT_CONFIG_* 环境变量只影响本进程拉起的 git，**不改用户任何 git 配置**
+// （这也正是插件自己的原则：git -c / 环境变量只作用于单次调用）。
+process.env.GIT_CONFIG_COUNT = '1'
+process.env.GIT_CONFIG_KEY_0 = 'core.autocrlf'
+process.env.GIT_CONFIG_VALUE_0 = 'false'
+
 // 日志默认落在插件仓库根目录；测试期间把它钉到临时目录，别让「跑一次测试」在仓库根
 // 留下 git-panel.log（默认路径由 lib/log.js 从 import.meta.url 推导，与 cwd 无关）。
 let tempHome = null
@@ -850,6 +861,173 @@ test('standalone：show / stashList / 单文件暂存与还原在真 git 里跑�
     assert.equal(list.payload.stash.length, 1)
     assert.equal(list.payload.stash[0].ref, 'stash@{0}', '编号必须原样解析（它是要交给 git 的参数）')
     assert.ok(list.payload.stash[0].text.includes('测试备份'), '说明文字要带出来：' + list.payload.stash[0].text)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+// ── 「本地名 ≠ 上游名」与「未合并删不掉」：对着**真 git** 走一遍 op 流水线 ────
+//
+// 这两条都是本次真实踩到的现场：点「推送」只回一句
+// `fatal: The upstream branch of your current branch does not match …`，
+// 点「删除」只回一句 `error: the branch 'main' is not fully merged`。
+// 面板的价值全在「换成中文 + 给出几个能点的按钮」上 —— 而那取决于
+// 「reason 认对了没有、choices 拼出来了没有」，只能对着真 git 验证。
+
+test('standalone：本地名与上游名不一致时，push 失败要给出三条可点的路', async (context) => {
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const run = promisify(execFile)
+  const { runPanelOp } = await import('../lib/routes.js')
+
+  const root = await mkdtemp(join(tmpdir(), 'git-panel-mismatch-'))
+  // 远端用一个**本地裸仓库**：这条用例不该依赖网络，也不该因为连不上而换一种失败。
+  const bare = await mkdtemp(join(tmpdir(), 'git-panel-bare-'))
+  try {
+    try {
+      await run('git', ['init', '-q', '-b', 'origin-main'], { cwd: root })
+    } catch {
+      await rm(root, { recursive: true, force: true })
+      await rm(bare, { recursive: true, force: true })
+      context.skip('本机没有可用的 git')
+      return
+    }
+    await run('git', ['init', '-q', '--bare', join(bare, 'demo.git')])
+    await run('git', ['-C', root, 'config', 'user.email', 't@t'])
+    await run('git', ['-C', root, 'config', 'user.name', 't'])
+    await writeFile(join(root, 'f.txt'), '第一版\n')
+    await run('git', ['-C', root, 'add', 'f.txt'])
+    await run('git', ['-C', root, 'commit', '-qm', '第一次提交'])
+
+    // 造出现场：本地分支 origin-main、跟踪 origin/main —— 默认配置 push.default=simple
+    // 只在两边同名时才肯裸推，所以这一下必然被 git 拒绝。
+    await run('git', ['-C', root, 'remote', 'add', 'origin', join(bare, 'demo.git')])
+    await run('git', ['-C', root, 'config', 'branch.origin-main.remote', 'origin'])
+    await run('git', ['-C', root, 'config', 'branch.origin-main.merge', 'refs/heads/main'])
+
+    const pushed = await runPanelOp('push', {}, root)
+    assert.equal(pushed.payload.ok, false, '名称不一致时裸 push 必须被 git 拒绝（否则用例前提不成立）')
+    assert.equal(
+      pushed.payload.reason,
+      'upstream-name-mismatch',
+      'reason 要认成「名称不一致」，而不是笼统的 rejected：' + JSON.stringify(pushed.payload.reason),
+    )
+    assert.match(String(pushed.payload.stderr), /does not match/i, 'stderr 要原样保留（排查用）')
+    assert.match(String(pushed.payload.hint), /同名|一致/, 'hint 要是中文解释：' + pushed.payload.hint)
+
+    const choices = pushed.payload.choices
+    assert.ok(Array.isArray(choices) && choices.length === 3, '要给出三条可点的路：' + JSON.stringify(choices))
+    assert.deepEqual(
+      choices.map((item) => item.op).sort(),
+      ['pushSameName', 'pushUpstream', 'renameBranch'],
+    )
+    const upstream = choices.find((item) => item.op === 'pushUpstream')
+    assert.deepEqual(
+      upstream.params,
+      { remote: 'origin', branch: 'main' },
+      '推到上游那条必须显式带上远程与远端分支名（不能猜）',
+    )
+
+    // 走一遍第一条路：显式 refspec 推到上游那个分支，本地名一点不动。
+    const done = await runPanelOp('pushUpstream', { remote: 'origin', branch: 'main' }, root)
+    assert.equal(done.payload.ok, true, '推到上游应该成功：' + JSON.stringify(done.payload.message))
+    const branch = await run('git', ['-C', root, 'branch', '--show-current'])
+    assert.equal(branch.stdout.trim(), 'origin-main', '本地分支名不该被改')
+    const remoteHeads = await run('git', ['-C', join(bare, 'demo.git'), 'branch', '--list'])
+    assert.match(remoteHeads.stdout, /main/, '远端应该收到 main 这个分支')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(bare, { recursive: true, force: true })
+  }
+})
+
+test('standalone：未合并的分支删不掉时给中文解释 + 强制删除；建分支撞远端名被宿主拒绝', async (context) => {
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const run = promisify(execFile)
+  const { runPanelOp } = await import('../lib/routes.js')
+
+  const root = await mkdtemp(join(tmpdir(), 'git-panel-delete-'))
+  try {
+    try {
+      await run('git', ['init', '-q', '-b', 'main'], { cwd: root })
+    } catch {
+      await rm(root, { recursive: true, force: true })
+      context.skip('本机没有可用的 git')
+      return
+    }
+    await run('git', ['-C', root, 'config', 'user.email', 't@t'])
+    await run('git', ['-C', root, 'config', 'user.name', 't'])
+    await writeFile(join(root, 'f.txt'), '第一版\n')
+    await run('git', ['-C', root, 'add', 'f.txt'])
+    await run('git', ['-C', root, 'commit', '-qm', '第一次提交'])
+    // 一条「有未合并提交」的分支：在上面提交后切回来，它就成了 -d 删不掉的那种。
+    await run('git', ['-C', root, 'switch', '-qc', 'feature'])
+    await writeFile(join(root, 'g.txt'), '只有这条分支有\n')
+    await run('git', ['-C', root, 'add', 'g.txt'])
+    await run('git', ['-C', root, 'commit', '-qm', '只有 feature 有'])
+    await run('git', ['-C', root, 'switch', '-q', 'main'])
+
+    const refused = await runPanelOp('deleteBranch', { branch: 'feature' }, root)
+    assert.equal(refused.payload.ok, false, '未合并的分支安全删除必须被拒绝')
+    assert.equal(refused.payload.reason, 'unmerged', '要认成「未完全合并」：' + refused.payload.reason)
+    assert.match(String(refused.payload.hint), /保护|防误删/, 'hint 要说清这是 git 的保护：' + refused.payload.hint)
+    assert.equal(refused.payload.choices.length, 1)
+    assert.equal(refused.payload.choices[0].op, 'deleteBranchForce')
+    assert.match(refused.payload.choices[0].confirm, /不可逆/)
+
+    // 点了「强制删除」之后真的删掉了（这条路的终点必须真的通）。
+    const forced = await runPanelOp('deleteBranchForce', { branch: 'feature' }, root)
+    assert.equal(forced.payload.ok, true, '强制删除应该成功：' + JSON.stringify(forced.payload.message))
+    const left = await run('git', ['-C', root, 'branch', '--no-color'])
+    assert.doesNotMatch(left.stdout, /feature/, '分支应该已经不在了：' + left.stdout)
+
+    // 建分支撞远端名：宿主也要拒（面板那一层只是提前说，不能是唯一的防线）。
+    await run('git', ['-C', root, 'remote', 'add', 'origin', 'https://example.invalid/demo.git'])
+    const guard = await runPanelOp('createBranch', { branch: 'origin/main' }, root)
+    assert.equal(guard.payload.ok, false, 'origin/main 这种名字要被宿主拒绝')
+    assert.match(String(guard.payload.message), /远端名/, '拒绝理由要说清是撞了远端名：' + guard.payload.message)
+    const fine = await runPanelOp('createBranch', { branch: 'feat/x' }, root)
+    assert.equal(fine.payload.ok, true, '正常的带斜杠分支名不该被误伤：' + JSON.stringify(fine.payload.message))
+
+    // AI 工具那条路走**同一个** assertSafeNewBranch：两半不可能分叉。
+    const { TOOL_SPECS } = await import('../lib/tools.js')
+    const branchTool = TOOL_SPECS.find((spec) => spec.name === 'git_branch')
+    await assert.rejects(
+      () => branchTool.toArgv({ name: 'origin/main' }, { dir: root }),
+      /远端名/,
+      'git_branch 建同名分支要被拒',
+    )
+    assert.deepEqual(
+      await branchTool.toArgv({ name: 'feat/x' }, { dir: root }),
+      ['branch', 'feat/x'],
+      '正常名字照常放行',
+    )
+    assert.deepEqual(
+      await branchTool.toArgv({ name: 'origin/main', delete: true, force: true }, { dir: root }),
+      ['branch', '-D', 'origin/main'],
+      '删除不算新建：清理这种名字反而应该放行',
+    )
+    const checkoutTool = TOOL_SPECS.find((spec) => spec.name === 'git_checkout')
+    await assert.rejects(
+      () => checkoutTool.toArgv({ branch: 'origin/main', create: true }, { dir: root }),
+      /远端名/,
+      'git_checkout --create 是建分支的另一种写法，同样要拦',
+    )
+
+    // 两个远程指向同一地址：状态里能看出来（宿主判定），并且能一键删掉多余的。
+    await run('git', ['-C', root, 'remote', 'add', 'dup', 'https://example.invalid/demo.git'])
+    const { readState } = await import('../lib/index.js')
+    assert.deepEqual(
+      (await readState(root)).duplicateRemotes,
+      [{ url: 'https://example.invalid/demo.git', keep: 'origin', remove: ['dup'] }],
+      '同地址的远程要成组，保留 origin',
+    )
+    const removed = await runPanelOp('removeRemote', { name: 'dup' }, root)
+    assert.equal(removed.payload.ok, true, '删远程应该成功：' + JSON.stringify(removed.payload.message))
+    assert.deepEqual((await readState(root)).duplicateRemotes, [], '删完就不该再报重复')
+    const listed = await run('git', ['-C', root, 'remote'])
+    assert.doesNotMatch(listed.stdout, /dup/, '远程配置里也不该再有它：' + listed.stdout)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

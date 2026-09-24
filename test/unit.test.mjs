@@ -36,6 +36,15 @@ import {
   classifyCheckoutFailure,
   checkoutHint,
   classifyPullFailure,
+  classifyDeleteBranchFailure,
+  deleteBranchHint,
+  classifyRenameFailure,
+  renameHint,
+  mismatchPushChoices,
+  forceDeleteChoice,
+  branchNameRemoteConflict,
+  upstreamBranchName,
+  duplicateRemotes,
   opTimeoutMs,
   OPS,
   GIT_LOCAL_TIMEOUT_MS,
@@ -774,4 +783,196 @@ test('日志：readLogTail 文件不存在时返回空数组而不是抛异常',
   setLogConfig({ file: join(logHome, 'does-not-exist.log') })
   assert.deepEqual(await readLogTail(10), [])
   setLogConfig({})
+})
+
+// ── 本地分支名 ≠ 上游分支名（本次的真实现场） ─────────────────────────────
+//
+// 现场：本地分支叫 `origin-main`、它跟踪的是 `origin/main`，点「推送」只回一句
+// `fatal: The upstream branch of your current branch does not match the name of
+// your current branch.`（push.default=simple 只在两边同名时才肯裸推）。
+// 这段话里没有一个字告诉用户下一步该做什么 —— 所以既要有分类，也要有可点的路。
+
+test('classifyPushFailure：本地名与上游名不一致要单独成一类，不能被 rejected 抢走', () => {
+  const real = 'fatal: The upstream branch of your current branch does not match\n'
+    + 'the name of your current branch.  To push to the upstream branch\n'
+    + 'on the remote, use\n\n    git push origin HEAD:main\n'
+  assert.equal(classifyPushFailure(real), 'upstream-name-mismatch')
+  // 单行形态（git 换行位置可能不同）
+  assert.equal(
+    classifyPushFailure('fatal: The upstream branch of your current branch does not match the name of your current branch.'),
+    'upstream-name-mismatch',
+  )
+  // 被 git 提到 push.default 时的说法
+  assert.equal(classifyPushFailure('fatal: push.default is set to ...'), 'upstream-name-mismatch')
+})
+
+test('pushHint：名称不一致这条必须给出「不用敲命令」的下一步', () => {
+  const hint = pushHint('upstream-name-mismatch')
+  assert.equal(typeof hint, 'string')
+  assert.match(hint, /同名|一致/, '要说清原因：两边名字不一样')
+  assert.match(hint, /选项|选一个/, '要指向下面那几条可点的路')
+  assert.doesNotMatch(hint, /^\s*fatal:/, '不能把 git 英文原文当提示')
+})
+
+test('upstreamBranchName：origin/main → main（含远端名带斜杠时按第一个斜杠切）', () => {
+  assert.equal(upstreamBranchName('origin/main'), 'main')
+  assert.equal(upstreamBranchName('upstream/feat/x'), 'feat/x')
+  assert.equal(upstreamBranchName('main'), null, '没有斜杠就不是上游全名')
+  assert.equal(upstreamBranchName('origin/'), null)
+  assert.equal(upstreamBranchName(null), null)
+  assert.equal(upstreamBranchName(''), null)
+})
+
+test('mismatchPushChoices：三条路都给出明确的 op 与参数（面板点了就能跑）', () => {
+  const choices = mismatchPushChoices({ remote: 'origin', branch: 'main', local: 'origin-main' })
+  assert.equal(choices.length, 3)
+  const byId = Object.fromEntries(choices.map((item) => [item.id, item]))
+  assert.equal(byId['push-upstream'].op, 'pushUpstream')
+  assert.deepEqual(byId['push-upstream'].params, { remote: 'origin', branch: 'main' })
+  assert.equal(byId['push-same-name'].op, 'pushSameName')
+  assert.deepEqual(byId['push-same-name'].params, { remote: 'origin' })
+  assert.equal(byId['rename-local'].op, 'renameBranch')
+  assert.deepEqual(byId['rename-local'].params, { name: 'main' })
+  // 三条都要能自解释：label 是按钮上那行字，detail 说清后果。
+  for (const item of choices) {
+    assert.ok(item.label.length > 0, item.id + ' 要有 label')
+    assert.ok(item.detail.length > 0, item.id + ' 要有 detail')
+  }
+  // 改名是有副作用的：必须二次确认，且确认文案里写清「历史不动」。
+  assert.match(byId['rename-local'].confirm, /提交历史/)
+  assert.equal(byId['push-upstream'].confirm, null, '推到上游是纯追加，不需要确认')
+})
+
+test('mismatchPushChoices：信息不全时宁缺勿猜（没有上游就不给「推到上游」）', () => {
+  assert.equal(mismatchPushChoices(null), null)
+  assert.equal(mismatchPushChoices({}), null)
+  assert.equal(mismatchPushChoices({ remote: 'origin' }), null, '既没 branch 也没 local → 没有可给的路')
+  const onlyBranch = mismatchPushChoices({ branch: 'main' })
+  assert.equal(onlyBranch, null)
+  const same = mismatchPushChoices({ remote: 'origin', branch: 'main', local: 'main' })
+  assert.ok(
+    !same.some((item) => item.id === 'rename-local'),
+    '两边同名时不该出现「改名」这条路（那本来就不是不一致）',
+  )
+})
+
+test('classifyDeleteBranchFailure：未完全合并被拒要认出来（git 的保护，不是故障）', () => {
+  assert.equal(classifyDeleteBranchFailure("error: the branch 'main' is not fully merged"), 'unmerged')
+  assert.equal(classifyDeleteBranchFailure('error: 分支 main 未完全合并'), 'unmerged')
+  assert.equal(classifyDeleteBranchFailure("error: branch 'main' not found."), 'missing')
+  assert.equal(classifyDeleteBranchFailure('fatal: something else'), 'none')
+})
+
+test('deleteBranchHint + forceDeleteChoice：讲清后果，再给一条可点的 -D', () => {
+  const hint = deleteBranchHint('unmerged')
+  assert.match(hint, /保护|防误删/, '要说清这是 git 的保护')
+  assert.match(hint, /强制删除/, '要指向「强制删除」这个出口')
+  assert.equal(deleteBranchHint('none'), null)
+
+  const choices = forceDeleteChoice('main')
+  assert.equal(choices.length, 1)
+  assert.equal(choices[0].op, 'deleteBranchForce')
+  assert.deepEqual(choices[0].params, { branch: 'main' })
+  assert.match(choices[0].confirm, /不可逆/, '不可逆的动作必须写在确认文案里')
+  assert.match(choices[0].confirm, /reflog/, '也要说明「还能找回」的边界')
+  assert.equal(forceDeleteChoice(null), null, '没有分支名就不给这条按钮')
+})
+
+test('classifyRenameFailure + renameHint：改名撞名时指向「推到上游」那条不用改名的路', () => {
+  assert.equal(classifyRenameFailure("fatal: A branch named 'main' already exists."), 'exists')
+  assert.equal(classifyRenameFailure("error: branch 'x' not found"), 'missing')
+  assert.equal(classifyRenameFailure('fatal: nothing here'), 'none')
+  const hint = renameHint('exists')
+  assert.match(hint, /已经有同名/, '要说清撞名这个事实')
+  assert.match(hint, /推送/, '要指向不用改名的替代路')
+  assert.equal(renameHint('none'), null)
+})
+
+test('branchNameRemoteConflict：新分支名撞远端名要被拦下（origin/main 这类）', () => {
+  assert.equal(branchNameRemoteConflict('origin/main', ['origin', 'upstream']), 'origin')
+  assert.equal(branchNameRemoteConflict('upstream/feat/x', ['origin', 'upstream']), 'upstream')
+  assert.equal(branchNameRemoteConflict('main', ['origin']), null)
+  assert.equal(branchNameRemoteConflict('origin-main', ['origin']), null, '横线不是命名空间分隔符')
+  assert.equal(branchNameRemoteConflict('feature/origin', ['origin']), null, '前缀不是远端名')
+  assert.equal(branchNameRemoteConflict('', ['origin']), null)
+  assert.equal(branchNameRemoteConflict('origin/main', []), null, '没有远端就不存在这个歧义')
+  assert.equal(branchNameRemoteConflict('origin/main', undefined), null)
+})
+
+test('新操作的 argv：显式 refspec，不依赖用户的 push.default 配置', async () => {
+  assert.deepEqual(
+    await buildOpArgv('pushUpstream', { remote: 'origin', branch: 'main' }, process.cwd()),
+    ['push', 'origin', 'HEAD:main'],
+  )
+  assert.deepEqual(
+    await buildOpArgv('pushSameName', { remote: 'origin' }, process.cwd()),
+    ['push', '--set-upstream', 'origin', 'HEAD'],
+  )
+  assert.deepEqual(
+    await buildOpArgv('deleteBranchForce', { branch: 'main' }, process.cwd()),
+    ['branch', '-D', 'main'],
+  )
+  // 参数不合法要当场拒绝（refspec 是拼出来的，不能让 -x、空格这类东西混进去）
+  await assert.rejects(() => buildOpArgv('pushUpstream', { remote: 'origin', branch: '-x' }, process.cwd()))
+  await assert.rejects(() => buildOpArgv('pushUpstream', { remote: 'origin' }, process.cwd()))
+  await assert.rejects(() => buildOpArgv('pushSameName', {}, process.cwd()))
+})
+
+test('OPS 注册表：删分支的两条路都在，且 classify/hint 都挂上了', () => {
+  for (const op of ['deleteBranch', 'deleteBranchForce']) {
+    assert.equal(typeof OPS[op].classify, 'function', op + ' 要挂失败分类')
+    assert.equal(typeof OPS[op].hint, 'function', op + ' 要挂中文提示')
+  }
+  assert.equal(typeof OPS.renameBranch.classify, 'function')
+  assert.equal(typeof OPS.createBranch.argv, 'function')
+  assert.equal(OPS.pushUpstream.network, true, '替代推送路也是联网操作（要走同一条加速线路）')
+  assert.equal(OPS.pushSameName.network, true)
+})
+
+// ── 两个远程指向同一地址（本次现场：remote `main` 与 `origin` 同 URL） ──────
+//
+// 冗余不只是难看：远程名会和本地分支名撞在一起 —— `git log main` /
+// `git branch -D main` 从此报 `warning: refname 'main' is ambiguous`。
+
+test('duplicateRemotes：同地址的远程成组，保留 origin', () => {
+  assert.deepEqual(duplicateRemotes([]), [])
+  assert.deepEqual(duplicateRemotes(null), [])
+  assert.deepEqual(duplicateRemotes([{ name: 'origin', url: 'git@x:y.git' }]), [], '只有一个远程不算重复')
+  assert.deepEqual(
+    duplicateRemotes([
+      { name: 'main', url: 'https://github.com/u/r.git' },
+      { name: 'origin', url: 'https://github.com/u/r.git' },
+    ]),
+    [{ url: 'https://github.com/u/r.git', keep: 'origin', remove: ['main'] }],
+    '有 origin 就保留 origin（git clone 的默认名），其余算可删',
+  )
+  // 没有 origin：保留传进来的第一个（parseRemotes 已按名字排好序，因此顺序是稳定的）
+  assert.deepEqual(
+    duplicateRemotes([{ name: 'a', url: 'u' }, { name: 'b', url: 'u' }]),
+    [{ url: 'u', keep: 'a', remove: ['b'] }],
+  )
+  // 三个同地址：其余两个都要出现在 remove 里
+  assert.deepEqual(
+    duplicateRemotes([
+      { name: 'origin', url: 'u' }, { name: 'dup1', url: 'u' }, { name: 'dup2', url: 'u' },
+    ])[0].remove,
+    ['dup1', 'dup2'],
+  )
+  // 地址不同不算重复；缺字段 / 非对象条目一律跳过（状态可能来自老宿主）
+  assert.deepEqual(duplicateRemotes([{ name: 'a', url: 'u1' }, { name: 'b', url: 'u2' }]), [])
+  assert.deepEqual(duplicateRemotes([{ name: 'a', url: '' }, { name: 'b' }, null, undefined]), [])
+  // 首尾空白不该造成「看起来一样却被判成两个地址」
+  assert.equal(
+    duplicateRemotes([{ name: 'a', url: ' u ' }, { name: 'b', url: 'u' }]).length,
+    1,
+  )
+})
+
+test('removeRemote 的 argv：只删本地配置的那条命令', async () => {
+  assert.deepEqual(
+    await buildOpArgv('removeRemote', { name: 'main' }, process.cwd()),
+    ['remote', 'remove', 'main'],
+  )
+  await assert.rejects(() => buildOpArgv('removeRemote', {}, process.cwd()), /远程名/)
+  assert.equal(OPS.removeRemote.network, undefined, '删远程不发网络请求')
 })
