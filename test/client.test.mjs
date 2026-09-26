@@ -2109,7 +2109,7 @@ test('client standalone：点最近提交的一行，把提交号交给宿主并
 
   const row = flattenTree(initial).find((node) =>
     node !== null && typeof node === 'object' && node.props !== undefined
-    && typeof node.props.onClick === 'function' && textOf(node) === 'abc1234第一次提交')
+    && typeof node.props.onClick === 'function' && textOf(node) === 'abc1234第一次提交切到此')
   assert.ok(row !== undefined, '提交行本身要可点（整行是一个动作）')
   await row.props.onClick()
   const after = await react.settle()
@@ -2123,10 +2123,44 @@ test('client standalone：点最近提交的一行，把提交号交给宿主并
   // 再点一次收起（同一个 hash）。
   const rowAgain = flattenTree(after).find((node) =>
     node !== null && typeof node === 'object' && node.props !== undefined
-    && typeof node.props.onClick === 'function' && textOf(node) === 'abc1234第一次提交')
+    && typeof node.props.onClick === 'function' && textOf(node) === 'abc1234第一次提交切到此')
   await rowAgain.props.onClick()
   const closed = await react.settle()
   assert.ok(!textOf(closed).includes('Author: 张三'), '再点同一行应收起详情')
+})
+
+test('client standalone：「切到此」点确认后走 stashSwitch 并带上提交号，不影响整行看详情', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: REPO_WITH_CHANGES,
+    opResponses: {
+      // 脏工作区（REPO_WITH_CHANGES 有 2 处改动）也走同一条 stashSwitch 通道。
+      stashSwitch: { ok: true, state: REPO_WITH_CHANGES },
+      branches: {
+        ok: true,
+        branches: { current: 'main', items: [{ name: 'main', current: true }] },
+        remoteBranches: { defaultRef: null, items: [] },
+        state: null,
+      },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+
+  const checkout = findButton(initial, '切到此')
+  assert.ok(checkout !== undefined, '最近提交行右侧应有「切到此」按钮')
+  await checkout.props.onClick({ stopPropagation: () => {} })
+  await react.settle()
+
+  const payloads = opPayloads(harness)
+  const switched = payloads.find((payload) => payload.op === 'stashSwitch')
+  assert.ok(switched !== undefined, '确认后应 POST op=stashSwitch：' + JSON.stringify(payloads))
+  assert.equal(switched.commit, 'abc1234', '提交号必须原样交给宿主（它是 git 的参数）')
+  assert.equal(switched.branch, undefined, '提交号模式不该混入 branch 字段')
+
+  // 「切到此」是行内小按钮：不能顺手触发行的「看详情」。
+  assert.ok(!payloads.some((payload) => payload.op === 'show'), '点小按钮不该把详情也展开')
 })
 
 test('client standalone：stash 备份能展开、恢复、删除（删除要确认）', async () => {

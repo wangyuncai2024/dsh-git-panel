@@ -806,6 +806,90 @@ test('standalone：stashSwitch —— 工作区干净时就是一条普通 switc
   }
 })
 
+// ── stashSwitch 的提交号模式：「切到此提交」（git switch --detach） ─────────
+//
+// 面板「最近提交」行的「切到此」走的就是这里。要钉住两件事：
+//   · 脏工作区同样走 stash 流程，改动一件不少；
+//   · 成功提示必须说明「游离 HEAD」与回去的路 —— 这是用户最慌的一步。
+
+test('standalone：stashSwitch —— commit 模式（脏工作区）切到历史提交，改动原样恢复', async (context) => {
+  const { stashSwitch, runGit } = await import('../lib/index.js')
+  const fixture = await stashPullFixture(context)
+  if (fixture === null) return
+  const { run, root, work } = fixture
+  try {
+    // 造一个「历史提交」：main 上再提交一次（**只新增文件**，不动 f.txt ——
+    // 否则 stash 弹回到旧提交时 f.txt 必然冲突，那是 git 的真实行为，不该在这里考），
+    // 然后拿第一次提交的短哈希当目标。
+    const first = await runGit(['rev-parse', 'HEAD'], work, { timeoutMs: 20000 })
+    await writeFile(join(work, 'g.txt'), '第二次提交新增的文件\n')
+    await run('git', ['-C', work, 'add', 'g.txt'])
+    await run('git', ['-C', work, 'commit', '-qm', 'B'])
+
+    // 工作区留两处改动：已跟踪文件 + 未跟踪文件。
+    await writeFile(join(work, 'f.txt'), '本地第一版\n我的本地改动\n')
+    await writeFile(join(work, 'u.txt'), '还没加入版本库\n')
+
+    const target = first.stdout.trim().slice(0, 7)
+    const payload = await stashSwitch({ commit: target }, work)
+
+    assert.equal(payload.ok, true, '切到历史提交应该成功：' + JSON.stringify(payload))
+    const head = await runGit(['rev-parse', '--short', 'HEAD'], work, { timeoutMs: 20000 })
+    assert.equal(head.stdout.trim(), target, 'HEAD 应该真的停在目标提交上')
+    const branch = await runGit(['branch', '--show-current'], work, { timeoutMs: 20000 })
+    assert.equal(branch.stdout.trim(), '', '游离 HEAD 下不该有当前分支')
+    assert.equal(await readFile(join(work, 'f.txt'), 'utf8'), '本地第一版\n我的本地改动\n',
+      '已跟踪文件的改动要原样恢复')
+    assert.equal(await readFile(join(work, 'u.txt'), 'utf8'), '还没加入版本库\n', '未跟踪文件要原样恢复')
+    const stash = await runGit(['stash', 'list'], work, { timeoutMs: 20000 })
+    assert.equal(stash.stdout.trim(), '', '成功后 stash 应该清空（改动已经弹回，不留备份）')
+    assert.ok(payload.notes.some((note) => note.includes('游离 HEAD')),
+      '成功提示要说明游离 HEAD 与回去的路：' + JSON.stringify(payload.notes))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('standalone：stashSwitch —— commit 模式（干净工作区）就是一条裸 switch --detach，不制造 stash', async (context) => {
+  const { stashSwitch, runGit } = await import('../lib/index.js')
+  const fixture = await stashPullFixture(context)
+  if (fixture === null) return
+  const { run, root, work } = fixture
+  try {
+    const first = await runGit(['rev-parse', 'HEAD'], work, { timeoutMs: 20000 })
+    await writeFile(join(work, 'f.txt'), '第二次提交的内容\n')
+    await run('git', ['-C', work, 'add', 'f.txt'])
+    await run('git', ['-C', work, 'commit', '-qm', 'B'])
+
+    const target = first.stdout.trim().slice(0, 7)
+    const payload = await stashSwitch({ commit: target }, work)
+    assert.equal(payload.ok, true, '干净工作区应该直接切成功：' + JSON.stringify(payload))
+    assert.equal(payload.command, 'git switch --detach ' + target, '命令要如实回显')
+    const head = await runGit(['rev-parse', '--short', 'HEAD'], work, { timeoutMs: 20000 })
+    assert.equal(head.stdout.trim(), target)
+    const stash = await runGit(['stash', 'list'], work, { timeoutMs: 20000 })
+    assert.equal(stash.stdout.trim(), '', '干净工作区不应该产生 stash')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('standalone：stashSwitch —— 提交号不合法时拒绝执行，工作区一点不动', async (context) => {
+  const { stashSwitch } = await import('../lib/index.js')
+  const fixture = await stashPullFixture(context)
+  if (fixture === null) return
+  const { root, work } = fixture
+  try {
+    for (const bad of ['--amend', 'main..other', '../../etc', ' HEAD~1']) {
+      const payload = await stashSwitch({ commit: bad }, work)
+      assert.equal(payload.ok, false, '不合法的提交号必须被拦下：' + bad)
+      assert.ok(String(payload.message).includes('不合法'), '要说明提交号不合法：' + String(payload.message))
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 // ── 新增操作走一遍真实的 op 流水线（含 field/parse 接线） ──────────────────
 //
 // 上面那些是逐段验证；这里把 routes.js 的 runPanelOp 真跑一遍：argv 构造 → 执行
