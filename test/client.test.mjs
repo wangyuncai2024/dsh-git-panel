@@ -1898,7 +1898,7 @@ test('client standalone：数组子节点必须都带 key（真实 React 会警�
   assertKeys(emptyTree)
 })
 
-test('client standalone：换工作区会收起分支管理器并清掉远程地址草稿（reducer 的 reset-repo）', async () => {
+test('client standalone：换工作区会收起分支管理器并清掉远程编辑器草稿（reducer 的 reset-repo）', async () => {
   const harness = makeFakeWindow({
     stateResponse: WS_A,
     opResponses: {
@@ -1921,8 +1921,10 @@ test('client standalone：换工作区会收起分支管理器并清掉远程地
   tree = await react.settle()
   assert.ok(textOf(tree).includes('本地分支'), '前置条件：分支管理器已展开')
 
-  // A 没有远程 → 按钮是「配置」；展开后填一个**没保存**的地址。
-  await findButton(tree, '配置').props.onClick()
+  // A 没有远程 → 卡片上是「+ 添加远程」；展开后填一个**没保存**的地址。
+  // （旧版这里是一个「配置」按钮 + 单一草稿；现在每个远程各自一个编辑器，
+  //   新增走 '+ 添加远程'，所以断言跟着换，验证的意图不变：草稿不能跨仓库带走。）
+  await findButton(tree, '+ 添加远程').props.onClick()
   tree = await react.settle()
   // 输入框的「内容」在 props.value 里（textOf 只看子节点，DOM 里的 input 也一样）。
   const remoteInput = (node) => flattenTree(node).find((child) =>
@@ -2789,3 +2791,214 @@ test('client standalone：两个远程指向同一地址时给出警告行与一
     '没有重复远程时不该有这一行',
   )
 })
+
+// ── 多远程：每个远程一行、各自编辑；编辑谁就保存到谁 ─────────────────────────
+//
+// 现场（本次真实仓库）：同时配了 `fork`（你的 fork）与 `origin`（官方）。
+// 旧面板只显示 remotes[0]（按名字排序 = fork），而展开的编辑框名字写死
+// `origin`、地址却播种自 remotes[0] —— 点「改」再点「保存」会把 **origin 的地址
+// 改成 fork 的地址**（本地实测复现：两个远程从此指向同一个 fork，官方地址丢失）。
+// 下面三条钉住修复后的行为：列全部、编辑谁是谁、保存发给正确的名字。
+
+const TWO_REMOTES = {
+  ...REPO_WITH_CHANGES,
+  remotes: [
+    { name: 'fork', url: 'git@github.com:me/demo.git' },
+    { name: 'origin', url: 'https://github.com/up/demo.git' },
+  ],
+  duplicateRemotes: [],
+}
+
+test('client standalone：多个远程全部列出（不再只显示第一个）', async () => {
+  const harness = makeFakeWindow({ stateResponse: TWO_REMOTES })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+
+  const rows = flattenTree(tree).filter((node) =>
+    node !== null && typeof node === 'object' && node.type === 'div'
+    && typeof node.props.className === 'string' && node.props.className.includes('dgp-remote-row'))
+  assert.equal(rows.length, 2, '两个远程要各占一行，实际：' + JSON.stringify(rows.map(textOf)))
+
+  const text = textOf(tree)
+  assert.ok(text.includes('fork'), 'fork 要出现在面板上')
+  assert.ok(text.includes('git@github.com:me/demo.git'), 'fork 的地址要出现')
+  assert.ok(text.includes('https://github.com/up/demo.git'), 'origin 的地址也要出现（旧版完全看不到它）')
+})
+
+test('client standalone：点某个远程的「改」，编辑器播种的是那一个远程（回归：串线会把 origin 改指向 fork）', async () => {
+  const harness = makeFakeWindow({ stateResponse: TWO_REMOTES })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+
+  // 找到 fork 那一行的「改」按钮（按行内定位，不按全局第一个按钮 —— 那正是旧 bug 的成因）。
+  const forkRow = flattenTree(tree).find((node) =>
+    node !== null && typeof node === 'object' && node.type === 'div'
+    && typeof node.props.className === 'string' && node.props.className.includes('dgp-remote-row')
+    && textOf(node).includes('fork'))
+  assert.ok(forkRow !== undefined, '前置条件：fork 行渲染出来了')
+  const editBtn = (forkRow.children ?? []).find((child) =>
+    child !== null && typeof child === 'object' && child.type === 'button' && textOf(child) === '改')
+  assert.ok(editBtn !== undefined, 'fork 行要有「改」')
+  await editBtn.props.onClick()
+  const opened = await react.settle()
+
+  // 编辑器里的地址框必须是 fork 的地址（旧版这里是 remotes[0]=fork 的地址，
+  // 但名字框写着 origin —— 保存就把 origin 改指向 fork）。
+  const urlInput = flattenTree(opened).find((node) =>
+    node !== null && typeof node === 'object' && node.type === 'input'
+    && String(node.props.placeholder).includes('git@github.com'))
+  assert.ok(urlInput !== undefined, '编辑器要出现地址输入框')
+  assert.equal(String(urlInput.props.value), 'git@github.com:me/demo.git',
+    '编辑 fork 时地址框里要是 fork 的地址')
+
+  // 名字在编辑态是只读文本（不可改），且显示的正是 fork。
+  const editBox = flattenTree(opened).find((node) =>
+    node !== null && typeof node === 'object' && node.type === 'div'
+    && typeof node.props.className === 'string' && node.props.className === 'dgp-remote-edit')
+  assert.ok(editBox !== undefined, '应渲染出编辑框')
+  assert.ok(textOf(editBox).includes('fork'), '编辑框要写明改的是哪个远程')
+
+  // 点「保存」→ 发给宿主的必须是 fork（而不是写死的 origin）。
+  const save = findButton(opened, '保存')
+  assert.ok(save !== undefined, '编辑器里要有「保存」')
+  await save.props.onClick()
+  await react.settle()
+  const saved = opPayloads(harness).filter((payload) => payload.op === 'setRemote')
+  assert.equal(saved.length, 1, '应该 POST 一次 setRemote：' + JSON.stringify(opPayloads(harness)))
+  assert.equal(saved[0].name, 'fork', '保存必须落到被点的那一个远程，而不是写死的 origin')
+  assert.equal(saved[0].url, 'git@github.com:me/demo.git', '地址也要是那一个远程的')
+})
+
+test('client standalone：「+ 添加远程」打开的是新增表单（名字可填），保存后走 setRemote', async () => {
+  const harness = makeFakeWindow({ stateResponse: TWO_REMOTES })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const tree = await react.settle()
+
+  const add = findButton(tree, '+ 添加远程')
+  assert.ok(add !== undefined, '应有「+ 添加远程」入口')
+  await add.props.onClick()
+  const opened = await react.settle()
+
+  const nameInput = flattenTree(opened).find((node) =>
+    node !== null && typeof node === 'object' && node.type === 'input'
+    && String(node.props.placeholder) === 'origin')
+  assert.ok(nameInput !== undefined, '新增表单要有可填的名字框')
+  nameInput.props.onChange({ target: { value: 'upstream' } })
+  const filled = await react.settle()
+  findInputByPlaceholder(filled, 'git@github.com').props.onChange(
+    { target: { value: 'https://github.com/official/demo.git' } })
+  const ready = await react.settle()
+  await findButton(ready, '保存').props.onClick()
+  await react.settle()
+
+  const saved = opPayloads(harness).filter((payload) => payload.op === 'setRemote')
+  assert.equal(saved.length, 1, '应该 POST 一次 setRemote')
+  assert.equal(saved[0].name, 'upstream', '新增用的名字来自输入框')
+  assert.equal(saved[0].url, 'https://github.com/official/demo.git')
+})
+
+// ── 本地/远端的对应关系：本地分支要标出「跟踪谁」，远端分支要按远程分组 ────────
+//
+// 用户原来的抱怨就是「远程和本地显示混乱、分不开」。这两条盯的正是分开之后
+// 最关键的一件事：**每个本地分支对应哪个远端**，以及**每个远端分支属于哪个远程**。
+
+test('client standalone：本地分支行标出跟踪关系（→ origin/main / 未跟踪）', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: TWO_REMOTES,
+    opResponses: {
+      branches: {
+        ok: true,
+        branches: {
+          current: 'main',
+          items: [{ name: 'main', current: true }, { name: 'local-only', current: false }],
+        },
+        remoteBranches: { defaultRef: 'origin/main', items: [] },
+        branchUpstreams: {
+          main: { upstream: 'origin/main', ahead: 1, behind: 2 },
+          'local-only': { upstream: null, ahead: 0, behind: 0 },
+        },
+        state: null,
+      },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+  await findButton(initial, '管理').props.onClick()
+  const opened = await react.settle()
+
+  const tags = flattenTree(opened).filter((node) =>
+    node !== null && typeof node === 'object' && node.type === 'span'
+    && typeof node.props.className === 'string' && node.props.className === 'dgp-track')
+  const texts = tags.map(textOf)
+  assert.ok(texts.some((text) => text.includes('→ origin/main')),
+    '跟踪 origin/main 的分支要标出来，实际：' + JSON.stringify(texts))
+  assert.ok(texts.some((text) => text.includes('领先 1') && text.includes('落后 2')),
+    '领先/落后要跟在跟踪关系后面（用户才知道推还是拉），实际：' + JSON.stringify(texts))
+  assert.ok(texts.some((text) => text === '未跟踪'),
+    '没有上游的分支要明说「未跟踪」，实际：' + JSON.stringify(texts))
+})
+
+test('client standalone：多远程时远端分支按远程分组，并标出当前分支跟踪的那组', async () => {
+  const harness = makeFakeWindow({
+    stateResponse: TWO_REMOTES,
+    opResponses: {
+      branches: {
+        ok: true,
+        branches: { current: 'main', items: [{ name: 'main', current: true }] },
+        remoteBranches: {
+          defaultRef: 'origin/main',
+          items: [
+            { remote: 'fork', name: 'main', ref: 'fork/main', head: false },
+            { remote: 'origin', name: 'main', ref: 'origin/main', head: true },
+          ],
+        },
+        branchUpstreams: { main: { upstream: 'origin/main', ahead: 0, behind: 0 } },
+        state: null,
+      },
+    },
+  })
+  const react = makeStatefulReact()
+  const { exports } = evaluateBundle(harness, react.api)
+  mountPanel(exports, react, sessionStore({ s1: { cwd: '/tmp/demo' } }))
+  const initial = await react.settle()
+  await findButton(initial, '管理').props.onClick()
+  const opened = await react.settle()
+
+  const groups = flattenTree(opened).filter((node) =>
+    node !== null && typeof node === 'object' && node.type === 'div'
+    && typeof node.props.className === 'string' && node.props.className === 'dgp-remote-group')
+  assert.equal(groups.length, 2, '两个远程要分成两组，实际：' + JSON.stringify(groups.map(textOf)))
+  assert.ok(groups.some((group) => textOf(group).includes('fork')), 'fork 组要存在')
+  assert.ok(groups.some((group) => textOf(group).includes('origin')), 'origin 组要存在')
+  // 当前分支跟踪 origin/main → 「当前跟踪」徽章挂在 origin 那组，而不是 fork。
+  const originGroup = groups.find((group) => textOf(group).includes('origin'))
+  assert.ok(textOf(originGroup).includes('当前跟踪'), '当前分支跟的那组要标「当前跟踪」')
+  const forkGroup = groups.find((group) => textOf(group).includes('fork'))
+  assert.ok(!textOf(forkGroup).includes('当前跟踪'), '没跟的那组不该标')
+
+  // 每组各自有「拿成新分支 / 比较」；点 fork 那组的「拿成新分支」要带上 fork。
+  // 定位方式：先找到渲染 `fork/main` 文本的那个 span，再取它的父行（行是一个 flex div）。
+  const forkRefSpan = flattenTree(opened).find((node) =>
+    node !== null && typeof node === 'object' && node.type === 'span' && textOf(node) === 'fork/main')
+  assert.ok(forkRefSpan !== undefined, 'fork/main 那一行要渲染出来')
+  const forkTake = flattenTree(opened).find((node) =>
+    node !== null && typeof node === 'object' && node.type === 'button' && textOf(node) === '拿成新分支')
+  assert.ok(forkTake !== undefined, '远端分支旁边要有「拿成新分支」')
+  // 面板里 fork/main 在 origin/main 之前（分组按远程名升序），所以第一个「拿成新分支」
+  // 就是 fork 那一组的 —— 这也顺带证明排序确实按远程分组走了。
+  await forkTake.props.onClick()
+  await react.settle()
+  const adopted = opPayloads(harness).filter((payload) => payload.op === 'adoptRemote')
+  assert.equal(adopted.length, 1, '应 POST 一次 adoptRemote')
+  assert.equal(adopted[0].remote, 'fork', '取回的必须是点的那一组（fork）')
+  assert.equal(adopted[0].branch, 'main')
+})
+

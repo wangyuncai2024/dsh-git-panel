@@ -22,6 +22,7 @@ import {
   repoPageUrl,
   normalizeDir,
   parseBranchOutput,
+  parseBranchUpstreams,
   parseRemoteBranchOutput,
   parseLsRemoteHead,
   isSafeRemoteRef,
@@ -417,6 +418,50 @@ test('parseRemoteBranchOutput：只有 HEAD 指针（远端分支还没下载下
 test('parseRemoteBranchOutput：空输出 / 非分支行都被忽略', () => {
   assert.deepEqual(parseRemoteBranchOutput(''), { items: [], defaultRef: null })
   assert.deepEqual(parseRemoteBranchOutput('  main\n  origin/\n'), { items: [], defaultRef: null })
+})
+
+// ── parseBranchUpstreams：git for-each-ref（面板「本地分支」的 → 远端 标签） ──
+
+test('parseBranchUpstreams：制表符分列，上游与领先/落后都解析出来', () => {
+  const table = parseBranchUpstreams(
+    'main\torigin/main\t[ahead 1, behind 2]\n'
+    + 'dev\tupstream/dev\t\n'
+    + 'solo\t\t\n',
+  )
+  assert.deepEqual(table, {
+    main: { upstream: 'origin/main', ahead: 1, behind: 2, gone: false },
+    dev: { upstream: 'upstream/dev', ahead: 0, behind: 0, gone: false },
+    solo: { upstream: null, ahead: 0, behind: 0, gone: false },
+  })
+})
+
+test('parseBranchUpstreams：中文 locale 的领先/落后同样认（数字不该跟着 git 语言变）', () => {
+  const table = parseBranchUpstreams('main\torigin/main\t[领先 3, 落后 4]\n')
+  assert.deepEqual(table.main, { upstream: 'origin/main', ahead: 3, behind: 4, gone: false })
+})
+
+test('parseBranchUpstreams：上游被删（[gone]）要标出来，而不是当成正常跟踪', () => {
+  const table = parseBranchUpstreams('feat\torigin/feat\t[gone]\n')
+  assert.equal(table.feat.upstream, 'origin/feat')
+  assert.equal(table.feat.gone, true, '[gone] 必须能被识别：否则界面显示「→ origin/feat」会骗人')
+})
+
+test('parseBranchUpstreams：畸形输入不抛异常（空行 / 缺字段 / CRLF / 非数字 / 含方括号的名字）', () => {
+  assert.deepEqual(parseBranchUpstreams(''), {})
+  assert.deepEqual(parseBranchUpstreams('\n\n'), {})
+  assert.deepEqual(parseBranchUpstreams('main'), { main: { upstream: null, ahead: 0, behind: 0, gone: false } })
+  assert.deepEqual(parseBranchUpstreams('main\t'), { main: { upstream: null, ahead: 0, behind: 0, gone: false } })
+  // 含方括号的分支名：这正是不能用 `git branch -vv` 解析的原因（那里切不出字段）。
+  assert.deepEqual(parseBranchUpstreams('feat[x]/y\torigin/feat[x]/y\t'), {
+    'feat[x]/y': { upstream: 'origin/feat[x]/y', ahead: 0, behind: 0, gone: false },
+  })
+  assert.deepEqual(parseBranchUpstreams('a\torigin/a\t[ahead x]\r\n'), {
+    a: { upstream: 'origin/a', ahead: 0, behind: 0, gone: false },
+  })
+  // 多余字段不越界，取前三个。
+  assert.deepEqual(parseBranchUpstreams('b\torigin/b\t[ahead 1]\tEXTRA'), {
+    b: { upstream: 'origin/b', ahead: 1, behind: 0, gone: false },
+  })
 })
 
 // ── parseLsRemoteHead：git ls-remote --symref <远程> HEAD（默认分支兜底） ──
